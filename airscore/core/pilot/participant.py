@@ -12,7 +12,7 @@ Stuart Mackintosh Antonio Golfari - 2019
 
 from calcUtils import get_date
 from db.conn import db_session
-from db.tables import TblParticipant as P
+from db.tables import TblParticipant as P, TblParticipantMeta as PA, TblCompAttribute as CA
 from pilot.pilot import Pilot
 from sources.civlrankings import (
     create_participant_from_CIVLID,
@@ -51,6 +51,7 @@ class Participant(Pilot):
         self.paid = paid  # bool
         self.status = status  # 'confirmed', 'waiting list', 'wild card', 'cancelled', ?
         self.live_id = live_id  # int
+        self.custom = {}  # dict attr_id: meta_value
         super().__init__(**kwargs)
 
     def __setattr__(self, attr, value):
@@ -82,6 +83,10 @@ class Participant(Pilot):
             if q:
                 participant = Participant(par_id=par_id)
                 q.populate(participant)
+                comp_attr = db.query(CA).filter_by(comp_id=participant.comp_id, attr_key='meta')
+                custom_attr = db.query(PA).filter_by(par_id=par_id)
+                participant.custom = {el.attr_id: next((x.meta_value for x in custom_attr
+                                                        if x.attr_id == el.attr_id), None) for el in comp_attr}
                 return participant
         return None
 
@@ -103,10 +108,15 @@ class Participant(Pilot):
         else:
             row = P.get_by_id(self.par_id)
             row.update(**self.as_dict())
+            PA.delete_all(par_id=self.par_id)
+        attr = []
+        for key in [k for k in self.custom.keys() if self.custom[k] is not None]:
+            attr.append(PA(par_id=self.par_id, attr_id=key, meta_value=self.custom[key]))
+        PA.bulk_create(attr)
         return self.par_id
 
     @staticmethod
-    def from_fsdb(pil, from_CIVL=False):
+    def from_fsdb(pil, from_CIVL=False, comp_attributes=None):
         """gets pilot obj. from FSDB file
         Input:
             - pil:          lxml.etree: FsParticipant section
@@ -128,28 +138,37 @@ class Participant(Pilot):
             '''get all pilot info from fsdb file'''
             if from_CIVL:
                 print('*** no result in CIVL database, getting data from FSDB file')
-            pilot = Participant(name=formatted_string(name), civl_id=CIVLID)
+            pilot = Participant(name=abbreviate(name), civl_id=CIVLID)
             pilot.sex = 'F' if int(pil.get('female') if pil.get('female') else 0) > 0 else 'M'
             pilot.nat = pil.get('nat_code_3166_a3') or None
         pilot.birthdate = get_date(pil.get('birthday') or None)
         pilot.ID = get_int(pil.get('id'))
-        pilot.glider = formatted_string(pil.get('glider'), title=False) or None
-        pilot.sponsor = formatted_string(pil.get('sponsor'), title=False) or None
-        """check fai is int"""
+        pilot.glider = abbreviate(pil.get('glider')) or None
+        pilot.sponsor = abbreviate(pil.get('sponsor')) or None
+        '''check fai is int'''
         if pil.get('fai_licence') in (0, '0', '', None):
             pilot.fai_valid = False
             pilot.fai_id = None
         else:
             pilot.fai_valid = True
             pilot.fai_id = None if pil.get('fai_licence') == '1' else pil.get('fai_licence')
-        """check Live ID"""
+        '''check custom attributes'''
         node = pil.find('FsCustomAttributes')
         if node is not None:
             childs = node.findall('FsCustomAttribute')
-            live = next((el.get('value') for el in childs if el.get('name').lower() == 'live'), None)
-            if live is not None and live.isdigit():
-                pilot.live_id = int(live)
-                # print(pilot.live_id)
+            pilot.attributes = []
+            for el in childs:
+                if el.get('value') in (None, ''):
+                    continue
+                elif el.get('name').lower() == 'live' and el.get('value').isdigit():
+                    pilot.live_id = int(el.get('value'))
+                elif el.get('name').lower() == 'team':
+                    pilot.team = el.get('value')
+                elif el.get('name').lower() in ('fai_id', 'fai_licence'):
+                    pilot.fai_id = el.get('value')
+                else:
+                    pilot.attributes.append({'attr_value': el.get('name'), 'meta_value': el.get('value')})
+
         return pilot
 
     @staticmethod
@@ -162,7 +181,7 @@ class Participant(Pilot):
             if result:
                 try:
                     pilot = Participant(pil_id=pilot_id, comp_id=comp_id)
-                    pilot.name = formatted_string(' '.join([result.first_name, result.last_name]))
+                    pilot.name = abbreviate(' '.join([result.first_name, result.last_name]))
                     if result.glider_brand:
                         pilot.glider = ' '.join([result.glider_brand.title(), result.glider])
                     else:
@@ -195,6 +214,7 @@ def extract_participants_from_excel(comp_id: int, filename, from_CIVL=False):
     id,name,nat,female,birthday,glider,color,sponsor,fai_licence,CIVILID,club,team,class,Live(optional)
     """
     from openpyxl import load_workbook
+    from ranking import CompAttribute
     from openpyxl.utils.exceptions import InvalidFileException
 
     '''load excel file'''
@@ -214,7 +234,18 @@ def extract_participants_from_excel(comp_id: int, filename, from_CIVL=False):
         return
     pilots = []
 
-    for row in sheet.iter_rows(min_row=2, min_col=1, max_col=14, values_only=True):
+    '''custom attributes'''
+    col = 15
+    custom_attributes = []
+    while True:
+        value = sheet.cell(1, col).value
+        if not value:
+            'no custom attributes'
+            break
+        custom_attributes.append(CompAttribute(comp_id=comp_id, attr_key='meta', attr_value=value))
+        col += 1
+
+    for row in sheet.iter_rows(min_row=2, min_col=1, max_col=col-1, values_only=True):
         if not row[0]:
             'EOF'
             break
@@ -223,20 +254,25 @@ def extract_participants_from_excel(comp_id: int, filename, from_CIVL=False):
         if from_CIVL and row[9]:
             pil = create_participant_from_CIVLID(row[9])
         if pil is None:
-            pil = Participant(civl_id=row[9], name=formatted_string(row[1]), nat=row[2], sex='F' if row[3] == 1 else 'M')
+            pil = Participant(civl_id=row[9], name=abbreviate(row[1]), nat=row[2], sex='F' if row[3] == 1 else 'M')
         pil.ID = row[0]
         pil.comp_id = comp_id
         pil.birthdate = None if row[4] is None else row[4].date()  # row[4] should be datetime
-        pil.glider = formatted_string(row[5], title=False) or None
+        pil.glider = abbreviate(row[5]) or None
         pil.glider_cert = row[12]
-        pil.sponsor = formatted_string(row[7], title=False) or None
+        pil.sponsor = abbreviate(row[7]) or None
         pil.team = row[11]
         pil.fai_id = row[8]
         pil.fai_valid = 0 if row[8] is None else 1
         pil.live_id = row[13]
+        '''custom attributes'''
+        if custom_attributes:
+            pil.attributes = []
+            for idx, el in enumerate(custom_attributes):
+                pil.attributes.append({'attr_value': el.attr_value, 'meta_value': row[14+idx]})
         pilots.append(pil)
 
-    return pilots
+    return pilots, custom_attributes
 
 
 def register_from_profiles_list(comp_id: int, pilots_ids: list):
@@ -280,10 +316,14 @@ def unregister_all_external_participants(comp_id: int):
     """ takes comp_id and unregisters all participants from comp without a pil_id."""
     from sqlalchemy import and_
 
-    with db_session() as db:
-        results = db.query(P).filter(and_(P.comp_id == comp_id, P.pil_id.is_(None)))
-        results.delete(synchronize_session=False)
-    return True
+    try:
+        with db_session() as db:
+            results = db.query(P).filter(and_(P.comp_id == comp_id, P.pil_id.is_(None)))
+            results.delete(synchronize_session=False)
+        return True
+    except Exception:
+        print(f'sqlalchemy error deleting all external pilots')
+        return False
 
 
 def mass_unregister(pilots):
@@ -311,46 +351,37 @@ def mass_import_participants(comp_id: int, participants: list, check_ids=True):
     Before inserting rows without par_id, we need to check if pilot is already in participants
     Will create a list of dicts from database, if not given as parameter"""
 
-    insert_mappings = []
-    update_mappings = []
-    assigned_ids = []
-
-    existing_list = P.get_dicts(comp_id)
+    objects = []
+    existing = [p for p in participants if p.par_id is not None]
     for par in participants:
-        r = {**par.as_dict(), 'comp_id': comp_id}
-        existing = next((el for el in existing_list if el['par_id'] == r['par_id']), None)
-        if r['par_id'] and existing is not None:
-            if check_ids and r['ID'] != existing['ID']:
-                assigned_id = assign_id(comp_id, r['ID'], participants=existing_list, assigned_ids=assigned_ids)
-                '''keep former ID if existing, and new is different and already taken'''
-                r['ID'] = existing['ID'] or assigned_id
-                existing['ID'] = r['ID']
-            update_mappings.append(r)
-        else:
-            if not any(p for p in existing_list if p['name'] == r['name']):
-                '''pilots seems not to be in database yet'''
-                if check_ids:
-                    r['ID'] = assign_id(comp_id, r['ID'], participants=existing_list, assigned_ids=assigned_ids)
-                    assigned_ids.append(r['ID'])
-                insert_mappings.append(r)
+        row = P.from_obj(par)
+        row.comp_id = comp_id
+        objects.append(row)
     '''update database'''
     with db_session() as db:
-        if insert_mappings:
-            db.bulk_insert_mappings(P, insert_mappings)
+        db.bulk_save_objects(objects=objects, return_defaults=True)
+        db.flush()
+        for idx, pil in enumerate(participants):
+            if pil.par_id is None and objects[idx].par_id is not None:
+                pil.par_id = objects[idx].par_id
+        '''update custom attributes'''
+        attr = []
+        par_attr_list = [el for el in participants if any(k for k, v in el.custom.items() if v is not None)]
+        if existing:
+            db.query(PA).filter(PA.par_id.in_([p.par_id for p in existing])).delete(synchronize_session=False)
             db.flush()
-            for elem in insert_mappings:
-                next(par for par in participants if par.name == elem['name']).par_id = elem['par_id']
-        if update_mappings:
-            db.bulk_update_mappings(P, update_mappings)
-        db.commit()
+        for el in [p for p in par_attr_list]:
+            attr.extend([PA(par_id=el.par_id, attr_id=k, meta_value=v) for k, v in el.custom.items() if v is not None])
+        if attr:
+            db.bulk_save_objects(objects=attr)
     return True
 
 
 def assign_id(comp_id: int, given_id: int = None, participants: list = None, assigned_ids: list = None) -> int:
-    """ assigns pilots and ID if not given and if not unique
-        comp_id: comp_id
-        given_id: ID that was given if any
-        participants: list of participants dicts"""
+    """assigns pilots and ID if not given and if not unique
+    comp_id: comp_id
+    given_id: ID that was given if any
+    participants: list of participants dicts"""
     from calcUtils import get_int
 
     if not participants:
@@ -368,8 +399,8 @@ def assign_id(comp_id: int, given_id: int = None, participants: list = None, ass
 
 
 def get_valid_ids(comp_id: int, participants: list) -> list:
-    """ gets a list of pilots and checks their ID validity against registered pilots and correct formats
-        returns a list of pilots with correct IDs"""
+    """gets a list of pilots and checks their ID validity against registered pilots and correct formats
+    returns a list of pilots with correct IDs"""
     '''get participants already in competition, to avoid same id'''
     registered = P.get_dicts(comp_id)
     assigned_ids = []
@@ -379,7 +410,7 @@ def get_valid_ids(comp_id: int, participants: list) -> list:
     return participants
 
 
-def formatted_string(string: str, length: int = 100, title: bool = True) -> str:
+def abbreviate(string: str, length: int = 100) -> str:
     """function to format participant string attributes that could be longer than database field.
     it tries to shorten string parts starting from last word, replacing with dotted initial letter, until string length
     is within given limit.
@@ -393,7 +424,7 @@ def formatted_string(string: str, length: int = 100, title: bool = True) -> str:
         while len(string) > length:
             try:
                 idx = data.index(next(el for el in data if len(el) > 2))
-                data[idx] = data[idx][0]+'.'
+                data[idx] = data[idx][0] + '.'
                 string = ' '.join(reversed(data))
                 print(f'name: {string}')
             except (ValueError, StopIteration):
@@ -402,4 +433,15 @@ def formatted_string(string: str, length: int = 100, title: bool = True) -> str:
                     idx -= 1
                 string = string[:idx]
     return string
+
+
+def get_attributes(par_id):
+    from db.tables import TblCompAttribute as CA
+    p = Participant.read(par_id)
+    attr_list = CA.get_all(comp_id=p.comp_id, attr_key='meta')
+    rows = PA.get_all(par_id=par_id)
+    for el in attr_list:
+        val = next((x.meta_value for x in rows if x.attr_id == el.attr_id), None)
+        p.custom[el.attr_id] = val
+    return p
 

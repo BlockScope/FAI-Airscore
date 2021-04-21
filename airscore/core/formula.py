@@ -7,7 +7,7 @@ Antonio Golfari - 2019
 """
 
 import importlib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, asdict
 from os import listdir
 
 from calcUtils import c_round
@@ -27,11 +27,14 @@ def list_formulas():
     for file in listdir('formulas'):
         if file[-3:] == '.py':
             formula_lib = get_formula_lib_by_name(file[:-3])
-            all_formulas.append(formula_lib.formula_name)
-            if formula_lib.formula_class == 'PG' or formula_lib.formula_class == 'BOTH':
-                pg_formulas.append(formula_lib.formula_name)
-            if formula_lib.formula_class == 'HG' or formula_lib.formula_class == 'BOTH':
-                hg_formulas.append(formula_lib.formula_name)
+            try:
+                all_formulas.append(formula_lib.formula_name)
+                if formula_lib.formula_class == 'PG' or formula_lib.formula_class == 'BOTH':
+                    pg_formulas.append(formula_lib.formula_name)
+                if formula_lib.formula_class == 'HG' or formula_lib.formula_class == 'BOTH':
+                    hg_formulas.append(formula_lib.formula_name)
+            except (AttributeError, Exception):
+                pass
     all_formulas = sorted(all_formulas)
     hg_formulas = sorted(hg_formulas)
     pg_formulas = sorted(pg_formulas)
@@ -42,9 +45,8 @@ def get_formula_lib_by_name(formula_name: str):
     """get formula library to use in scoring"""
     formula_file = 'formulas.' + formula_name.lower()
     try:
-        lib = importlib.import_module(formula_file, package=None)
-        return lib
-    except(ModuleNotFoundError, Exception):
+        return importlib.import_module(formula_file, package=None)
+    except (ModuleNotFoundError, Exception):
         print(f'formula file {formula_file} not found.')
         return None
 
@@ -88,6 +90,10 @@ class FormulaPreset:
     def as_formula(self):
         """ gets presets' value"""
         return {x.name: getattr(self, x.name).value for x in fields(self)}
+
+    def has_calculated_values(self):
+        """ returns True if any value needs to be calculated using lib.calculate_parameters()"""
+        return any(v.get('calculated') for k, v in asdict(self).items())
 
 
 class Formula(object):
@@ -198,6 +204,7 @@ class Formula(object):
     @property
     def formula_type(self):
         import re
+
         try:
             return re.search(r"[a-zA-Z]*", self.formula_name).group().lower()
         except (TypeError, AttributeError):
@@ -210,6 +217,7 @@ class Formula(object):
     @property
     def formula_version(self):
         import re
+
         try:
             return int(re.search(r"(\d+)", self.formula_name).group())
         except (TypeError, AttributeError):
@@ -275,15 +283,10 @@ class Formula(object):
         return formula
 
     @staticmethod
-    def from_preset(comp_class, formula_name):
+    def from_preset(comp_class: str, formula_name: str):
         """ Create Formula obj. from preset values in formula script"""
-        preset = None
-        lib_name = 'formulas.' + formula_name.lower()
-        lib = importlib.import_module(lib_name)
-        if comp_class in ('PG', 'mixed'):
-            preset = lib.pg_preset
-        elif comp_class == 'HG':
-            preset = lib.hg_preset
+        lib = get_formula_lib_by_name(formula_name)
+        preset = lib.pg_preset if comp_class in ('PG', 'mixed') else lib.hg_preset
         return Formula(**preset.as_formula())
 
     @staticmethod
@@ -317,6 +320,18 @@ class Formula(object):
             if hasattr(formula, key):
                 setattr(formula, key, value)
         return formula
+
+    def reset(self, comp_class: str, formula_name: str):
+        lib = get_formula_lib_by_name(formula_name)
+        preset = lib.pg_preset if comp_class in ('PG', 'mixed') else lib.hg_preset
+        self.as_dict().update(preset.as_formula())
+        self.calculate_parameters(lib)
+
+    def calculate_parameters(self, lib=None):
+        if not lib:
+            lib = get_formula_lib_by_name(self.formula_name)
+        if 'calculate_parameters' in dir(lib):
+            lib.calculate_parameters(self.as_dict())
 
     def to_db(self):
         """stores formula to TblForComp table in AirScore database"""
@@ -417,6 +432,7 @@ class TaskFormula(Formula):
 def get_fsdb_info(formula: Formula or TaskFormula, fsdb_data) -> Formula or TaskFormula:
     """Updates a Formula or TaskFormula object with data from an FSDB file"""
     from calcUtils import get_int
+
     formula.formula_name = fsdb_data.get('id')
     '''scoring parameters'''
     formula.min_dist = float(fsdb_data.get('min_dist')) * 1000  # min. distance, meters
@@ -436,6 +452,8 @@ def get_fsdb_info(formula: Formula or TaskFormula, fsdb_data) -> Formula or Task
         else 'on'
         if fsdb_data.get('use_distance_points') == '1'
         else 'off'
+        if fsdb_data.get('use_distance_points') == '0'
+        else formula.formula_distance
     )
     '''arrival points: position, time, off'''
     formula.formula_arrival = (
@@ -444,6 +462,8 @@ def get_fsdb_info(formula: Formula or TaskFormula, fsdb_data) -> Formula or Task
         else 'time'
         if fsdb_data.get('use_arrival_time_points') == '1'
         else 'off'
+        if fsdb_data.get('use_arrival_time_points') == '0' and fsdb_data.get('use_arrival_position_points') == '0'
+        else formula.formula_arrival
     )
     # departure points: leadout, on, off
     formula.formula_departure = (
@@ -452,27 +472,42 @@ def get_fsdb_info(formula: Formula or TaskFormula, fsdb_data) -> Formula or Task
         else 'on'
         if fsdb_data.get('use_departure_points') == '1'
         else 'off'
+        if fsdb_data.get('use_departure_points') == '0' and fsdb_data.get('use_leading_points') == '0'
+        else formula.formula_departure
     )
     '''time points: on, off'''
-    formula.formula_time = 'on' if fsdb_data.get('use_time_points') == '1' else 'off'
+    formula.formula_time = ('on' if fsdb_data.get('use_time_points') == '1'
+                            else 'off'if fsdb_data.get('use_time_points') == '0'
+                            else formula.formula_time)
     '''leading points factor'''
     if fsdb_data.get('leading_weight_factor'):
         formula.lead_factor = float(fsdb_data.get('leading_weight_factor'))
     '''tolerance'''
     if fsdb_data.get('turnpoint_radius_tolerance'):
         formula.tolerance = float(fsdb_data.get('turnpoint_radius_tolerance'))  # tolerance, perc / 100
+    if fsdb_data.get('turnpoint_radius_minimum_absolute_tolerance'):
+        formula.min_tolerance = get_int(fsdb_data.get('turnpoint_radius_minimum_absolute_tolerance'))  # m
     '''stopped task parameters'''
-    formula.validity_min_time = (
-            get_int(fsdb_data.get('min_time_span_for_valid_task')) * 60)  # min. time for valid task, seconds
-    formula.score_back_time = get_int(fsdb_data.get('score_back_time')) * 60  # Scoreback Time, seconds
-    formula.glide_bonus = float(fsdb_data.get('bonus_gr'))  # glide ratio
+    if fsdb_data.get('min_time_span_for_valid_task'):
+        formula.validity_min_time = (
+            get_int(fsdb_data.get('min_time_span_for_valid_task')) * 60
+        )  # min. time for valid task, seconds
+    if fsdb_data.get('score_back_time'):
+        formula.score_back_time = get_int(fsdb_data.get('score_back_time')) * 60  # Scoreback Time, seconds
+    if fsdb_data.get('bonus_gr'):
+        formula.glide_bonus = float(fsdb_data.get('bonus_gr'))  # glide ratio
     '''bonus and penalties'''
-    formula.no_goal_penalty = c_round(1.0 - float(fsdb_data.get('time_points_if_not_in_goal')), 4)
+    if fsdb_data.get('time_points_if_not_in_goal'):
+        formula.no_goal_penalty = c_round(1.0 - float(fsdb_data.get('time_points_if_not_in_goal')), 4)
     if fsdb_data.get('final_glide_decelerator') == 'aatb':
         formula.arr_alt_bonus = float(fsdb_data.get('aatb_factor'))
     '''jump the gun'''
     if not fsdb_data.get('jump_the_gun_factor') == '0':
         formula.max_JTG = get_int(fsdb_data.get('jump_the_gun_max'))  # seconds
         formula.JTG_penalty_per_sec = c_round(1 / float(fsdb_data.get('jump_the_gun_factor')), 4)
+    '''results decimals'''
+    if fsdb_data.get('number_of_decimals_task_results'):
+        formula.task_result_decimal = get_int(fsdb_data.get('number_of_decimals_task_results'))
+        formula.comp_result_decimal = get_int(fsdb_data.get('number_of_decimals_competition_results'))
 
     return formula

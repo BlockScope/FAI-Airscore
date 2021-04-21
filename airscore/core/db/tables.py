@@ -2,6 +2,7 @@
 from sqlalchemy import (
     CHAR,
     TIMESTAMP,
+    func,
     Boolean,
     Column,
     Date,
@@ -43,7 +44,6 @@ class CompObjectView(BaseModel):
         Column('date_to', Date),
         Column('MD_name', String(100)),
         Column('contact', String(100)),
-        Column('cat_id', INTEGER(11)),
         Column('sanction', String(20), server_default=text("'none'")),
         Column('comp_type', Enum('RACE', 'Route', 'Team-RACE'), server_default=text("'RACE'")),
         Column('comp_code', String(8)),
@@ -132,6 +132,7 @@ class TaskFormulaView(BaseModel):
         Column('max_JTG', SMALLINT(6)),
         Column('JTG_penalty_per_sec', Float(4)),
         Column('scoring_altitude', Enum('GPS', 'QNH'), server_default=text("'GPS'")),
+        Column('task_result_decimal', INTEGER(4)),
         Column('team_scoring', TINYINT(1)),
         Column('team_size', INTEGER(4)),
         Column('max_team_size', INTEGER(4)),
@@ -250,27 +251,6 @@ class RegionWaypointView(BaseModel):
     )
 
 
-class TaskAirspaceCheckView(BaseModel):
-    __table__ = Table(
-        'TaskAirspaceCheckView',
-        metadata,
-        Column('task_id', INTEGER(11), primary_key=True),
-        Column('airspace_check', TINYINT(1)),
-        Column('notification_distance', SMALLINT(4)),
-        Column('function', Enum('linear', 'non-linear'), server_default=text("'linear'")),
-        Column('h_outer_limit', SMALLINT(4)),
-        Column('h_inner_limit', SMALLINT(4)),
-        Column('h_boundary', SMALLINT(4)),
-        Column('h_boundary_penalty', Float(3)),
-        Column('h_max_penalty', Float(3)),
-        Column('v_outer_limit', SMALLINT(4)),
-        Column('v_inner_limit', SMALLINT(4)),
-        Column('v_boundary', SMALLINT(4)),
-        Column('v_boundary_penalty', Float(3)),
-        Column('v_max_penalty', Float(3)),
-    )
-
-
 class TaskObjectView(BaseModel):
     __table__ = Table(
         'TaskObjectView',
@@ -307,7 +287,7 @@ class TaskObjectView(BaseModel):
         Column('locked', TINYINT(3), server_default=text("'0'")),
         Column('airspace_check', TINYINT(1)),
         Column('openair_file', String(40)),
-        Column('cancelled', TINYINT(1), server_default=text("'1'")),
+        Column('cancelled', TINYINT(1), server_default=text("'0'")),
         Column('track_source', String(40)),
         Column('task_path', String(40)),
         Column('comp_path', String(40)),
@@ -371,16 +351,6 @@ class TblCertification(BaseModel):
     cert_order = Column(TINYINT(1), nullable=False)
 
 
-class TblClassification(BaseModel):
-    __tablename__ = 'tblClassification'
-
-    cat_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
-    cat_name = Column(String(60), nullable=False)
-    comp_class = Column(Enum('PG', 'HG', 'mixed'), nullable=False, server_default=text("'PG'"))
-    female = Column(TINYINT(1), nullable=False, server_default=text("'1'"))
-    team = Column(TINYINT(1), nullable=False, server_default=text("'0'"))
-
-
 class TblCountryCode(BaseModel):
     __tablename__ = 'tblCountryCode'
 
@@ -412,9 +382,8 @@ class TblForComp(BaseModel):
     __tablename__ = 'tblForComp'
 
     comp_id = Column(INTEGER(11), ForeignKey('tblCompetition.comp_id'), primary_key=True)
-    formula_last_update = Column(
-        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-    )
+    last_update = Column(TIMESTAMP, nullable=False,
+                         server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
     formula_name = Column(String(20))
     overall_validity = Column(Enum('ftv', 'all', 'round'), nullable=False, server_default=text("'ftv'"))
     validity_param = Column(Float, nullable=False, server_default=text("'0.75'"))
@@ -458,7 +427,7 @@ class TblLadder(BaseModel):
     ladder_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
     ladder_name = Column(String(100), nullable=False)
     ladder_class = Column(Enum('PG', 'HG'), nullable=False, server_default=text("'PG'"))
-    nation_code = Column(INTEGER(11), server_default=text("'380'"))
+    nat = Column(String(10))
     date_from = Column(Date)
     date_to = Column(Date)
     external = Column(TINYINT(1), server_default=text("'0'"))
@@ -491,6 +460,11 @@ class TblParticipant(BaseModel):
     ranking = Column(MEDIUMINT(9))
     paid = Column(TINYINT(1), server_default=text("'0'"))
     hours = Column(SMALLINT(6))
+    child_par_attr = relationship(
+        "TblParticipantMeta", back_populates="parent_par",
+        cascade="all, delete",
+        passive_deletes=True
+    )
 
     @classmethod
     def get_dicts(cls, comp_id: int) -> list:
@@ -499,14 +473,6 @@ class TblParticipant(BaseModel):
         with db_session() as db:
             print(f'session id: {id(db)}')
             return [el.as_dict() for el in db.query(P).filter_by(comp_id=comp_id).all()]
-
-
-class TblRanking(BaseModel):
-    __tablename__ = 'tblRanking'
-
-    rank_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
-    rank_name = Column(String(40), nullable=False)
-    comp_class = Column(Enum('PG', 'HG', 'mixed'), nullable=False, server_default=text("'PG'"))
 
 
 class TblRegion(BaseModel):
@@ -557,15 +523,6 @@ class TblXContestCode(BaseModel):
     xccCountryName = Column(String(42))
 
 
-TblClasCertRank = Table(
-    'tblClasCertRank',
-    metadata,
-    Column('cat_id', ForeignKey('tblClassification.cat_id', ondelete='CASCADE'), nullable=False, index=True),
-    Column('cert_id', ForeignKey('tblCertification.cert_id'), index=True),
-    Column('rank_id', ForeignKey('tblRanking.rank_id'), nullable=False, index=True),
-)
-
-
 class TblCompetition(BaseModel):
     __tablename__ = 'tblCompetition'
     __table_args__ = (Index('comp_id', 'comp_id', 'comp_name', unique=True),)
@@ -574,7 +531,7 @@ class TblCompetition(BaseModel):
     comp_name = Column(String(100), nullable=False)
     comp_code = Column(String(8))
     comp_class = Column(Enum('PG', 'HG', 'mixed'), server_default=text("'PG'"))
-    comp_last_update = Column(
+    last_update = Column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
     )
     comp_site = Column(String(100), nullable=False)
@@ -583,7 +540,6 @@ class TblCompetition(BaseModel):
     time_offset = Column(MEDIUMINT(9), nullable=False, server_default=text("'0'"))
     MD_name = Column(String(100))
     contact = Column(String(100))
-    cat_id = Column(ForeignKey('tblClassification.cat_id', ondelete='SET NULL'), index=True)
     sanction = Column(String(20), nullable=False, server_default=text("'none'"))
     openair_file = Column(String(40))
     comp_type = Column(Enum('RACE', 'Route', 'Team-RACE'), server_default=text("'RACE'"))
@@ -600,8 +556,17 @@ class TblCompetition(BaseModel):
     self_register = Column(TINYINT(1))
     check_g_record = Column(Boolean)
 
-    cat = relationship('TblClassification')
     ladders = relationship('TblLadder', secondary='tblLadderComp')
+    child_comp_attr = relationship(
+        "TblCompAttribute", back_populates="parent_comp",
+        cascade="all, delete",
+        passive_deletes=True
+    )
+    child_comp_check = relationship(
+        "TblAirspaceCheck", back_populates="parent_comp_check",
+        cascade="all, delete",
+        passive_deletes=True
+    )
 
 
 class TblCompAuth(BaseModel):
@@ -613,13 +578,72 @@ class TblCompAuth(BaseModel):
     comp = relationship(TblCompetition, backref='Auth')
 
 
+class TblCompAttribute(BaseModel):
+    __tablename__ = 'tblCompAttribute'
+
+    attr_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
+    comp_id = Column(INTEGER(11), ForeignKey("tblCompetition.comp_id"), nullable=False)
+    attr_key = Column(String(100), nullable=False)
+    attr_value = Column(String(100), nullable=True)
+    comp = relationship(TblCompetition, backref='CompAttr')
+    child_attr = relationship(
+        "TblParticipantMeta", back_populates="parent_comp_attr",
+        cascade="all, delete",
+        passive_deletes=True
+    )
+    parent_comp = relationship('TblCompetition', back_populates="child_comp_attr")
+
+
+class TblCompRanking(BaseModel):
+    __tablename__ = 'tblCompRanking'
+
+    rank_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
+    comp_id = Column(INTEGER(11), ForeignKey("tblCompetition.comp_id"), nullable=False)
+    rank_name = Column(String(40), nullable=False)
+    rank_type = Column(String(40), nullable=False, server_default=text("'cert'"))
+    cert_id = Column(INTEGER(11), ForeignKey("tblCertification.cert_id"), nullable=True)
+    min_date = Column(Date)
+    max_date = Column(Date)
+    attr_id = Column(INTEGER(11), ForeignKey("tblCompAttribute.attr_id"), nullable=True)
+    rank_value = Column(String(100))
+    comp = relationship('TblCompetition')
+    cert = relationship('TblCertification')
+    attr = relationship('TblCompAttribute')
+
+
+class TblParticipantMeta(BaseModel):
+    __tablename__ = 'tblParticipantMeta'
+
+    pat_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
+    par_id = Column(INTEGER(11), ForeignKey("tblParticipant.par_id", ondelete="CASCADE"), nullable=False)
+    attr_id = Column(INTEGER(11), ForeignKey("tblCompAttribute.attr_id", ondelete="CASCADE"), nullable=False)
+    meta_value = Column(String(100))
+    parent_par = relationship('TblParticipant', back_populates='child_par_attr')
+    parent_comp_attr = relationship('TblCompAttribute', back_populates="child_attr")
+
+
+class TblLadderRanking(BaseModel):
+    __tablename__ = 'tblLadderRanking'
+
+    rank_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
+    ladder_id = Column(INTEGER(11), ForeignKey("tblLadder.ladder_id"), nullable=False)
+    rank_name = Column(String(40), nullable=False)
+    rank_type = Column(String(40), nullable=False, server_default=text("'cert'"))
+    cert_id = Column(INTEGER(11), ForeignKey("tblCertification.cert_id"), nullable=True)
+    min_date = Column(Date)
+    max_date = Column(Date)
+    rank_key = Column(String(100))
+    rank_value = Column(String(100))
+    ladder = relationship('TblLadder')
+    ladder_cert = relationship('TblCertification')
+
+
 class TblLadderSeason(BaseModel):
     __tablename__ = 'tblLadderSeason'
 
     ladder_id = Column(ForeignKey('tblLadder.ladder_id'), nullable=False, index=True, primary_key=True)
     season = Column(INTEGER(6), nullable=False, index=True)
     active = Column(TINYINT(1), server_default=text("'1'"))
-    cat_id = Column(ForeignKey('tblClassification.cat_id'), nullable=False, index=True)
     overall_validity = Column(Enum('all', 'ftv', 'round'), nullable=False, server_default=text("'ftv'"))
     validity_param = Column(Float, nullable=False)
 
@@ -631,23 +655,28 @@ TblRegionXCSites = Table(
     Column('xccSiteID', INTEGER(11), nullable=False, index=True),
 )
 
-TblCompAirspaceCheck = Table(
-    'tblCompAirspaceCheck',
-    metadata,
-    Column('comp_id', ForeignKey('tblCompetition.comp_id', ondelete='CASCADE'), nullable=False, unique=True),
-    Column('notification_distance', SMALLINT(4), nullable=False, server_default=text("'100'")),
-    Column('function', Enum('linear', 'non-linear'), nullable=False, server_default=text("'linear'")),
-    Column('h_outer_limit', SMALLINT(4), nullable=False, server_default=text("'70'")),
-    Column('h_boundary', SMALLINT(4), nullable=False, server_default=text("'0'")),
-    Column('h_boundary_penalty', Float(3), nullable=False, server_default=text("'0.1'")),
-    Column('h_inner_limit', SMALLINT(4), nullable=False, server_default=text("'-30'")),
-    Column('h_max_penalty', Float(3), nullable=False, server_default=text("'1'")),
-    Column('v_outer_limit', SMALLINT(4), nullable=False, server_default=text("'70'")),
-    Column('v_boundary', SMALLINT(4), nullable=False, server_default=text("'0'")),
-    Column('v_boundary_penalty', Float(3), nullable=False, server_default=text("'0.1'")),
-    Column('v_inner_limit', SMALLINT(4), nullable=False, server_default=text("'30'")),
-    Column('v_max_penalty', Float(3), nullable=False, server_default=text("'1'")),
-)
+
+class TblAirspaceCheck(BaseModel):
+    __tablename__ = 'tblAirspaceCheck'
+
+    check_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
+    comp_id = Column(ForeignKey('tblCompetition.comp_id', ondelete='CASCADE'), nullable=False)
+    task_id = Column(INTEGER(11), ForeignKey("tblTask.task_id", ondelete='CASCADE'), nullable=True)
+    notification_distance = Column(SMALLINT(4), nullable=False, server_default=text("'100'"))
+    function = Column(Enum('linear', 'non-linear'), nullable=False, server_default=text("'linear'"))
+    h_outer_limit = Column(SMALLINT(4), nullable=False, server_default=text("'70'"))
+    h_boundary = Column(SMALLINT(4), nullable=False, server_default=text("'0'"))
+    h_boundary_penalty = Column(Float(3), nullable=False, server_default=text("'0.1'"))
+    h_inner_limit = Column(SMALLINT(4), nullable=False, server_default=text("'-30'"))
+    h_max_penalty = Column(Float(3), nullable=False, server_default=text("'1'"))
+    v_outer_limit = Column(SMALLINT(4), nullable=False, server_default=text("'70'"))
+    v_boundary = Column(SMALLINT(4), nullable=False, server_default=text("'0'"))
+    v_boundary_penalty = Column(Float(3), nullable=False, server_default=text("'0.1'"))
+    v_inner_limit = Column(SMALLINT(4), nullable=False, server_default=text("'-30'"))
+    v_max_penalty = Column(Float(3), nullable=False, server_default=text("'1'"))
+
+    parent_comp_check = relationship('TblCompetition', back_populates='child_comp_check')
+    parent_task_check = relationship('TblTask', back_populates="child_task_check")
 
 
 class TblLadderComp(BaseModel):
@@ -679,7 +708,7 @@ class TblTask(BaseModel):
 
     task_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
     comp_id = Column(ForeignKey('tblCompetition.comp_id'), index=True)
-    task_last_update = Column(
+    last_update = Column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
     )
     task_num = Column(TINYINT(4), nullable=False)
@@ -695,7 +724,6 @@ class TblTask(BaseModel):
     start_iteration = Column(TINYINT(4))
     task_deadline = Column(MEDIUMINT(9))
     stopped_time = Column(MEDIUMINT(9))
-    tasResultsType = Column(String(20))
     task_type = Column(
         Enum('race', 'elapsed time', 'free distance', 'distance with bearing'), server_default=text("'race'")
     )
@@ -724,9 +752,11 @@ class TblTask(BaseModel):
     reg = relationship('TblRegion')
     comp = relationship('TblCompetition')
     Results = relationship('TblTaskResult')
-
-    # comp = relationship('TblCompetition', backref="tasks", lazy='subquery')
-    # Results = relationship('TblTaskResult', backref="task")
+    child_task_check = relationship(
+        "TblAirspaceCheck", back_populates="parent_task_check",
+        cascade="all, delete",
+        passive_deletes=True
+    )
 
 
 class TblTaskResult(BaseModel):
@@ -736,9 +766,7 @@ class TblTaskResult(BaseModel):
     track_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
     task_id = Column(ForeignKey('tblTask.task_id', ondelete='SET NULL'), index=True)
     par_id = Column(INTEGER(11), ForeignKey('tblParticipant.par_id'), index=True)
-    track_last_update = Column(
-        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-    )
+    last_update = Column(TIMESTAMP, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
     track_file = Column(String(255))
     g_record = Column(TINYINT(4), server_default=text("'1'"))
     distance_flown = Column(Float)
@@ -923,6 +951,8 @@ class TblTaskWaypoint(BaseModel):
 
     wpt_id = Column(INTEGER(11), primary_key=True, autoincrement=True)
     task_id = Column(ForeignKey('tblTask.task_id', ondelete='SET NULL'), index=True)
+    last_update = Column(TIMESTAMP, nullable=False,
+                         server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
     num = Column(TINYINT(4), nullable=False)
     name = Column(CHAR(6), nullable=False)
     rwp_id = Column(INTEGER(11))

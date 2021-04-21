@@ -5,17 +5,18 @@ Pilot Admin
 {% endblock %}
 
 {% block head %}
-<!-- CSS -->
-<link href='/static/css/task.css' rel='stylesheet'>
-<link href='https://maxcdn.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css' rel='stylesheet'>
-<link href='https://cdn.datatables.net/1.10.21/css/jquery.dataTables.min.css' rel='stylesheet'>
 <!-- JS -->
 <script type='text/javascript' src='/static/js/utils.js'></script>
 <script type='text/javascript' src='/static/js/microajax.minified.js'></script>
 {% endblock %}
 
+{% block css %}
+<link href='/static/css/task.css' rel='stylesheet'>
+<link href='https://maxcdn.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css' rel='stylesheet'>
+{% endblock %}
+
 {% block back %}
-<a href="{{ url_for('user.comp_settings_admin', compid=session.compid)}}" class='btn btn-info' type='button'>
+<a href="{{ url_for('user.comp_settings_admin', compid=session.compid)}}" class='btn btn-primary'>
   Back to Competition Settings
 </a>
 {% endblock %}
@@ -27,20 +28,20 @@ Pilot Admin
 {% block content %}
 {% if not session.external %}
 <p>
-  <button class='btn btn-primary ml-4' type='button' data-toggle='collapse' data-target='#collapse1'
-          aria-expanded='false' aria-controls='collapse1'>
+  <button class='btn btn-primary ml-4' type='button' data-toggle='collapse' data-target='#register_pilot'
+          aria-expanded='false' aria-controls='register_pilot'>
     Register Pilots
   </button>
 </p>
-<div class='collapse' id='collapse1'>
+<div class='collapse' id='register_pilot'>
   {% if pilotdb %}
   <p>
-    <button class='btn btn-primary ml-5' type='button' data-toggle='collapse' data-target='#collapse3'
-            aria-expanded='false' aria-controls='collapse3'>
+    <button class='btn btn-primary ml-5' type='button' data-toggle='collapse' data-target='#internal_pilots'
+            aria-expanded='false' aria-controls='internal_pilots'>
       Internal Pilots
     </button>
   </p>
-  <div class='collapse' id='collapse3'>
+  <div class='collapse' id='internal_pilots'>
     <div class='card card-body'>
       <div class='container'>
         <center>
@@ -78,19 +79,20 @@ Pilot Admin
   </div>
 
   <p>
-    <button class='btn btn-primary ml-5' type='button' data-toggle='collapse' data-target='#collapse4'
-            aria-expanded='false' aria-controls='collapse4'>
+    <button class='btn btn-primary ml-5' type='button' data-toggle='collapse' data-target='#external_pilots'
+            aria-expanded='false' aria-controls='external_pilots'>
       External Pilots
     </button>
   </p>
 
-  <div class='collapse' id='collapse4'>
+  <div class='collapse' id='external_pilots'>
   {% endif %}
 
     <div class='card card-body'>
       <div class='container'>
         <h4 style='float:left'>Registered {% if pilotdb %}External {% endif %}Pilots:</h4>
         <h4 id='total_external_pilots'></h4>
+        {% if session.is_editor %}
         <button id='manual_add_pilot_button' class='btn btn-success ml-4' onclick="add_participant()">
           Add a pilot
         </button>
@@ -103,6 +105,7 @@ Pilot Admin
         <button id='delete_external' data-toggle='modal' data-target='#delete_modal' class='btn btn-danger ml-4'>Remove
           All
         </button>
+        {% endif %}
       </div>
     </div>
   {% if pilotdb %}
@@ -113,12 +116,12 @@ Pilot Admin
 {% endif %}
 
 <p>
-  <button class='btn btn-primary ml-4' type='button' data-toggle='collapse' data-target='#collapse2'
-          aria-expanded='false' aria-controls='collapse2'>
+  <button class='btn btn-primary ml-4' type='button' data-toggle='collapse' data-target='#pilot_details'
+          aria-expanded='false' aria-controls='pilot_details'>
     Registered Pilot Details
   </button>
 </p>
-<div class='collapse' id='collapse2'>
+<div class='collapse' id='pilot_details'>
   <div class='card card-body'>
     <div class='container'>
       <h3 class='font-weight-bold'>Registered Pilot Details</h3>
@@ -136,6 +139,32 @@ Pilot Admin
   </div>
 </div>
 
+<p>
+  <button class='btn btn-primary ml-4' type='button' data-toggle='collapse' data-target='#custom_attributes'
+          aria-expanded='false' aria-controls='custom_attributes'>
+    Custom Attributes
+  </button>
+</p>
+<div class='collapse' id='custom_attributes'>
+  <div class='card card-body'>
+    <div class='container'>
+      <h3 class='font-weight-bold'>Participants Custom Attributes</h3>
+      <h4 id='total_attributes'></h4>
+      <h6 class='text-danger font-weight-bold mt-3' id='attribute_messages'></h6>
+      {% if session.is_editor %}
+      <button id='add_attr_button' class='btn btn-success' onclick="new_attribute()">
+          Add
+      </button>
+      {% endif %}
+      <table id='attributes_table' class='row-border table-hover compact' cellspacing='0' width='100%'>
+        <thead class="thead-dark">
+        </thead>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% if session.is_editor %}
 <!--- add-edit-participant details modal starts here--->
 <div id='mod_modal' class='modal fade' role='dialog'>
   <div class='modal-dialog'>
@@ -152,24 +181,27 @@ Pilot Admin
               <input type="hidden" id="mod_original_id_number" value="">
               <input type="hidden" id="mod_last_id_number" value="">
               <input type="hidden" id="mod_par_id" value="">
-              {{ render_field(participant_form.id_num, width=3, id='mod_id_number') }}
-              {{ render_field(participant_form.CIVL, width=5, id='mod_civl') }}
-              {{ render_field(participant_form.name, width=30, id='mod_name') }}
+              {{ render_field(participant_form.id_num, size=3, id='mod_id_number') }}
+              {{ render_field(participant_form.CIVL, size=5, id='mod_civl') }}
+              {{ render_field(participant_form.name, size=30, id='mod_name') }}
+            </section>
+            <section class="pl-1 row-wrap panel-row">
+              {{ render_field(participant_form.birthdate, id='mod_birthdate') }}
             </section>
             <section class="pl-1 row-wrap panel-row">
               {{ render_field(participant_form.nat, id='mod_nat') }}
               {{ render_field(participant_form.sex, id='mod_sex') }}
             </section>
             <section class="pl-1 row-wrap panel-row">
-              {{ render_field(participant_form.glider, width=30, id='mod_glider') }}
-              {{ render_field(participant_form.certification, width=4, id='mod_certification') }}
+              {{ render_field(participant_form.glider, size=30, id='mod_glider') }}
+              {{ render_field(participant_form.certification, id='mod_certification') }}
             </section>
             <section class="pl-1 row-wrap panel-row">
-              {{ render_field(participant_form.sponsor, width=40, id='mod_sponsor') }}
+              {{ render_field(participant_form.sponsor, size=40, id='mod_sponsor') }}
             </section>
             <section class="pl-1 row-wrap panel-row" id="mod_all_team_section">
               <section id="mod_team_section">
-              {{ render_field(participant_form.team, width=40, id='mod_team') }}
+              {{ render_field(participant_form.team, size=40, id='mod_team') }}
               </section>
               <section id="mod_nat_team_section">
               {{ render_field(participant_form.nat_team, id='mod_nat_team') }}
@@ -177,16 +209,25 @@ Pilot Admin
             </section>
             <section class="pl-1 row-wrap panel-row" id="mod_track_source_section">
               <section id="mod_flymaster_section">
-              {{ render_field(participant_form.live_id, width=7, id='mod_live_id') }}
+              {{ render_field(participant_form.live_id, size=7, id='mod_live_id') }}
               </section>
               <section id="mod_xcontest_section">
-              {{ render_field(participant_form.xcontest_id, width=10, id='mod_xcontest_id') }}
+              {{ render_field(participant_form.xcontest_id, size=10, id='mod_xcontest_id') }}
               </section>
             </section>
             <section class="pl-1 row-wrap panel-row">
               {{ render_field(participant_form.status, id='mod_status') }}
               {{ render_field(participant_form.paid, id='mod_paid') }}
             </section>
+            {% if attributes %}
+            {% from "macros.html" import render_input with context %}
+            <section class="pl-1 row-wrap panel-row" id="mod_comp_attr_section">
+              {% for el in attributes %}
+              {% set id = 'attr_'+el.attr_id|string %}
+              {{ render_input(id, el.attr_value, 35) }}
+              {% endfor %}
+            </section>
+            {% endif %}
           </div>
         </div>
         <div class='modal-errors'>
@@ -200,6 +241,33 @@ Pilot Admin
   </div>
 </div>
 <!--- add-edit-participant details-Modal ends here--->
+
+<!--- add-edit-custom-attribute modal starts here--->
+<div id='attr_modal' class='modal fade' role='dialog'>
+  <div class='modal-dialog'>
+    <div class='modal-content'>
+      <div class='modal-header'>
+        <h4 class='modal-title'>Update Custom Attribute</h4>
+      </div>
+      <div class='modal-body'>
+        {% from "macros.html" import render_input with context %}
+        <section class="pl-1 row-wrap panel-row">
+          <input type="hidden" id="attr_id" value="">
+          {{ render_input('attr_value', 'Name', 35) }}
+        </section>
+      </div>
+      <div class='modal-errors'>
+      </div>
+      <div class='modal-footer'>
+        <button type='button' class='btn btn-danger' data-dismiss='modal'>Cancel</button>
+        <button type='button' class='btn btn-success'  data-dismiss='modal'
+                onclick='save_custom_attribute();' id='attr_save_confirmed'>Save
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+<!--- add-edit-custom-attribute Modal ends here--->
 
 <!-- delete Modal -->
 <div id='delete_modal' class='modal fade' role='dialog'>
@@ -222,6 +290,29 @@ Pilot Admin
   </div>
 </div>
 <!-- end delete Modal -->
+
+<!-- remove-attribute Modal -->
+<div id='remove-attribute_modal' class='modal fade' role='dialog'>
+  <div class='modal-dialog'>
+    <div class='modal-content'>
+      <div class='modal-header'>
+        <h4 class='modal-title'>Please confirm: delete custom attribute</h4>
+      </div>
+      <div class='modal-body'>
+        <h6 id="delete_attr_name"></h6>
+        <p>This will remove attribute informations from all participants</p>
+        <input type="hidden" id="remove_attr_id" value="">
+      </div>
+      <div class='modal-footer'>
+        <button type='button' class='btn btn-success' data-dismiss='modal'>Cancel</button>
+        <button id='remove-attribute_confirmed' type='button' onclick='confirm_remove_attribute();' class='btn btn-danger'
+                data-dismiss='modal'>Delete
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- end remove-attribute Modal -->
 
 <!--- upload excel file Modal starts here--->
 <div id='excel_modal' class='modal fade' tabindex='-1' role='dialog'>
@@ -286,21 +377,23 @@ Pilot Admin
   </div>
 </div>
 <!--- upload excel file Modal ends here--->
-
+{% endif %}
 {% endblock %}
 
 {% block js %}
-<script type='text/javascript' src='https://cdn.datatables.net/1.10.21/js/jquery.dataTables.min.js'></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
 <script src="{{ static_url_for('static', filename='js/multiselect.min.js') }}"></script>
 <script src="{{ static_url_for('static', filename='js/jquery-file-upload/jquery.ui.widget.js') }}"></script>
 <script src="{{ static_url_for('static', filename='js/jquery-file-upload/jquery.iframe-transport.js') }}"></script>
 <script src="{{ static_url_for('static', filename='js/jquery-file-upload/jquery.fileupload.js') }}"></script>
 <script src="{{ static_url_for('static', filename='js/pilot_admin.js') }}"></script>
-<script src="{{ static_url_for('static', filename='js/flashed_message.js') }}"></script>
+
 <script type='text/javascript'>
 var pilotdb = {{ pilotdb|tojson }};
 var compid = {{ session.compid|tojson }};
 var external_comp = {{ session.external|tojson }};
+var is_editor = {{ session.is_editor|tojson }};
+var attributes = {{ attributes|tojson }};
 var track_source = {{ session.track_source|tojson }};
 var unregister_participant_url = "{{ url_for('user._unregister_participant', compid=session.compid) }}";
 var check_team_size_url = "{{ url_for('user._check_team_size', compid=session.compid) }}";

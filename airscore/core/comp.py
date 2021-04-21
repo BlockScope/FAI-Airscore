@@ -12,14 +12,14 @@ Stuart Mackintosh Antonio Golfari - 2019
 """
 
 import json
+import compUtils
+from pathlib import Path
 
 from calcUtils import c_round, get_date
 from compUtils import (
-    create_classifications,
     create_comp_path,
     get_participants,
-    get_tasks_result_files,
-    read_rankings,
+    get_tasks_result_files
 )
 from db.conn import db_session
 from db.tables import TblCompetition
@@ -29,7 +29,7 @@ from pilot.participant import Participant
 from result import CompResult, create_json_file
 from sqlalchemy import and_
 from task import Task
-from pathlib import Path
+from ranking import create_rankings
 
 
 class Comp(object):
@@ -76,13 +76,10 @@ class Comp(object):
         self.region = region  # Region object
         self.participants = []  # list of Participant obj
         self.tasks = []  # list of Task obj.
-        # self.stats = dict()  # event statistics
-        self.rankings = dict()  # rankings
-        # self.data = dict()
+        self.rankings = []  # rankings
         self.formula = None  # Formula obj.
         self.MD_name = None  # str
         self.contact = None  # str
-        self.cat_id = None  # cat_id
         self.sanction = None  # 'League', 'PWC', 'FAI 1', 'FAI 2', 'none'
         self.comp_type = comp_type  # 'RACE', 'Route', 'Team-RACE'
         self.comp_code = comp_code  # str 8 chars codename
@@ -291,7 +288,7 @@ class Comp(object):
         return self.comp_id
 
     def get_rankings(self):
-        self.rankings = create_classifications(self.cat_id)
+        self.rankings = create_rankings(self.comp_id, self.comp_class)
 
     @staticmethod
     def from_fsdb(fs_comp, short_name: str = None):
@@ -328,32 +325,7 @@ class Comp(object):
 
     def get_tasks_details(self):
         """gets tasks details from database. They could be different from JSON data for scored tasks"""
-        from db.tables import TaskObjectView as T
-
-        with db_session() as db:
-            results = (
-                db.query(
-                    T.task_id,
-                    T.reg_id,
-                    T.region_name,
-                    T.task_num,
-                    T.task_name,
-                    T.date,
-                    T.opt_dist,
-                    T.comment,
-                    T.window_open_time,
-                    T.task_deadline,
-                    T.window_close_time,
-                    T.start_time,
-                    T.start_close_time,
-                    T.track_source,
-                )
-                .filter_by(comp_id=self.comp_id)
-                .all()
-            )
-            if results:
-                results = [row._asdict() for row in results]
-            return results
+        return compUtils.get_tasks_details(self.comp_id)
 
     @staticmethod
     def from_json(comp_id: int, ref_id=None):
@@ -379,7 +351,7 @@ class Comp(object):
                         setattr(comp, k, v)
                 # comp.as_dict().update(data['info'])
                 comp.stats = dict(**data['stats'])
-                comp.rankings.update(data['rankings'])
+                comp.rankings = data['rankings']
                 comp.tasks.extend(data['tasks'])
                 comp.formula = Formula.from_dict(data['formula'])
                 comp.data = dict(**data['file_stats'])
@@ -408,10 +380,17 @@ class Comp(object):
         '''PARAMETER: decimal positions'''
         if decimals is None or not isinstance(decimals, int):
             decimals = comp.formula.comp_result_decimal
+        td = comp.formula.task_result_decimal
         '''retrieve active task result files and reads info'''
         files = get_tasks_result_files(comp_id)
         '''initialize obj attributes'''
         comp.participants = get_participants(comp_id)
+        comp.results.extend(
+            [
+                dict(results={}, **{x: getattr(p, x) for x in CompResult.result_list if x in dir(p)})
+                for p in comp.participants
+            ]
+        )
         ''' get rankings '''
         comp.get_rankings()
         for idx, t in enumerate(files):
@@ -420,49 +399,19 @@ class Comp(object):
             ''' task validity (if not using ftv, ftv_validity = day_quality)'''
             r = task.ftv_validity * 1000
             '''get pilots result'''
-            for p in comp.participants:
-                res = next((d for d in comp.results if d.get('par_id', None) == p.par_id), False)
-                if res is False:
-                    ''' create pilot result Dict (once)'''
-                    # comp.results.append({'par_id': p.par_id, 'results': []})
-                    comp.results.append({'par_id': p.par_id})
-                    res = comp.results[-1]
-                # TODO need to decide which rounding to use and has to be the same in task results
-                # this is less than desirable, just to be consistent with task results
-                s = next(
-                    (
-                        c_round(float(f"{c_round(float(pil.score or 0), 1):.{decimals}f}"), decimals)
-                        for pil in task.pilots
-                        if pil.par_id == p.par_id
-                    ),
-                    0,
-                )
-                # s = next((c_round(pil.score or 0, decimals) for pil in task.pilots if pil.par_id == p.par_id), 0)
-                if r > 0:  # sanity
-                    perf = c_round(s / r, decimals + 3)
-                    # res['results'].append({task.task_code: {'pre': s, 'perf': perf, 'score': s}})
-                    res.update({task.task_code: {'pre': s, 'perf': perf, 'score': s}})
-                else:
-                    # res['results'].append({task.task_code: {'pre': s, 'perf': 0, 'score': 0}})
-                    res.update({task.task_code: {'pre': s, 'perf': 0, 'score': 0}})
+            for p in comp.results:
+                s = next((res.score or 0 for res in task.pilots if res.par_id == p['par_id']), 0)
+                perf = c_round(s / r, td + 3)
+                p['results'][task.task_code] = {'pre': c_round(s, td), 'perf': perf, 'score': c_round(s, td)}
 
         '''calculate final score'''
         comp.get_final_scores(decimals)
-        ''' create result elements'''
-        results = []
-        for res in comp.results:
-            '''create results dict'''
-            p = next(x for x in comp.participants if x.par_id == res['par_id'])
-            r = {x: getattr(p, x) for x in CompResult.result_list if x in dir(p)}
-            r['score'] = res['score']
-            r['results'] = {x: res[x] for x in res.keys() if isinstance(res[x], dict)}
-            results.append(r)
         '''create json file'''
         result = {
             'info': {x: getattr(comp, x) for x in CompResult.info_list},
             'rankings': comp.rankings,
             'tasks': [{x: getattr(t, x) for x in CompResult.task_list} for t in comp.tasks],
-            'results': results,
+            'results': comp.results,
             'formula': {x: getattr(comp.formula, x) for x in CompResult.formula_list},
             'stats': {x: getattr(comp, x) for x in CompResult.stats_list},
         }
@@ -471,7 +420,7 @@ class Comp(object):
         )
         return comp, ref_id, filename, timestamp
 
-    def get_final_scores(self, d=0):
+    def get_final_scores(self, cd=0):
         """calculate final scores depending on overall validity:
         - all:      sum of all tasks results
         - round:    task discard every [param] tasks
@@ -488,6 +437,7 @@ class Comp(object):
         val = self.formula.overall_validity
         param = self.formula.validity_param
         avail_validity = self.avail_validity
+        td = self.formula.task_result_decimal
 
         for pil in self.results:
             pil['score'] = 0
@@ -498,25 +448,20 @@ class Comp(object):
             '''
             if not ((val == 'all') or (val == 'round' and self.dropped_tasks == 0) or (len(self.tasks) < 2)):
                 '''create a ordered list of results, perf desc'''
-                # sorted_results = sorted(pil['results'], key=lambda x: (x[1]['perf'], x[1]['pre']), reverse=True)
-                sorted_results = sorted(
-                    [x for x in pil.items() if isinstance(x[1], dict)],
-                    key=lambda x: (x[1]['perf'], x[1]['pre']),
-                    reverse=True,
-                )
+                sorted_results = sorted(pil['results'].items(), key=lambda x: (x[1]['perf'], x[1]['pre']), reverse=True)
 
                 if val == 'round' and len(self.tasks) >= param:
                     '''we need to order by score desc and sum only the ones we need'''
                     for i in range(self.dropped_tasks):
                         idx = sorted_results.pop()[0]  # getting id of worst result task
-                        pil[idx]['score'] = 0
+                        pil['results'][idx]['score'] = 0
 
                 elif val == 'ftv' and len(self.tasks) > 1:
                     '''ftv calculation'''
                     pval = avail_validity
                     for idx, s in sorted_results:
                         if not (pval > 0):
-                            pil[idx]['score'] = 0
+                            pil['results'][idx]['score'] = 0
                         else:
                             '''get ftv_validity of corresponding task'''
                             tval = next(t.ftv_validity for t in self.tasks if t.task_code == idx)
@@ -525,11 +470,11 @@ class Comp(object):
                                 pval -= tval
                             else:
                                 '''we need to calculate proportion'''
-                                pil[idx]['score'] = c_round(pil[idx]['score'] * (pval / tval), d)
+                                pil['results'][idx]['score'] = c_round(pil['results'][idx]['score'] * (pval / tval), td)
                                 pval = 0
 
             '''calculates final pilot score'''
-            pil['score'] = sum(pil[x]['score'] for x in pil.keys() if isinstance(pil[x], dict))
+            pil['score'] = c_round(sum(pil['results'][x]['score'] for x in pil['results'].keys()), cd)
 
         ''' order list'''
         self.results = sorted(self.results, key=lambda x: x['score'], reverse=True)
@@ -574,14 +519,15 @@ class Comp(object):
 
 def delete_comp(comp_id, files=True):
     """delete all database entries and files on disk related to comp"""
+    from shutil import rmtree
+
+    from compUtils import get_comp_path
     from db.tables import TblForComp as FC
     from db.tables import TblParticipant as P
     from db.tables import TblResultFile as RF
     from db.tables import TblTask as T
     from result import delete_result
     from task import delete_task
-    from compUtils import get_comp_path
-    from shutil import rmtree
 
     comp_path = get_comp_path(comp_id)
 

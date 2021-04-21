@@ -1,85 +1,119 @@
 // Task Scores Table
 function populate_task_scores(){
-    let filename = task.selected;
-    $('#task_result').dataTable({
-        ajax: '/users/_get_task_score_from_file/' + taskid + '/' + filename,
-        paging: false,
-        destroy: true,
-        searching: true,
-        info: false,
-        columns: [
-            {data: 'rank', title:'#'},
-            {data: 'name', title:'Pilot'},
-            {data: 'SSS', title:'SS'},
-            {data: 'ESS', title:'ES'},
-            {data: 'time', title:'Time'},
-            {data: 'altbonus', title:'altbonus', id:'altbonus'},
-            {data: 'distance', title:'Kms'},
-            {data: 'speedP', title:'Spd'},
-            {data: 'leadP', title:'LO p', id:'leading'},
-            {data: 'arrivalP', title:'Arv'},
-            {data: 'distanceP', title:'Dst'},
-            {data: 'penalty', title:'Pen'},
-            {data: 'score', title:'Tot'},
-            {data: null, title: 'Notifications'},
-            {data: null, title: ""}
-        ],
-        rowId: function(data) {
-            return 'id_' + data.par_id;
-        },
-        columnDefs: [{
-            targets: [-2],  render: function (a, b, data, d) {
-            if (data.notifications){
-                var airspace = '';
-                var track = '';
-                var JTG = '';
-                var admin = '';
-                $.each( data.notifications, function( key, value ) {
-                    if (value.notification_type=="airspace"){
-                        airspace = 'CTR ';
-                    }
-                    if (value.notification_type=="track"){
-                        track = 'IGC ';
-                    }
-                    if (value.notification_type=="admin"){
-                        admin = 'Admin ';
-                    }
-                    if (value.notification_type=="jtg"){
-                        JTG = 'JTG ';
-                    }
-                });
-                return(airspace + track + JTG + admin);
-            }
-            else { return (""); }
+  let filename = task.selected;
+  $('#task_result').dataTable({
+    ajax: '/users/_get_task_score_from_file/' + taskid + '/' + filename,
+    paging: false,
+    destroy: true,
+    searching: true,
+    info: false,
+    columns: [
+      {data: 'rank', title:'#'},
+      {data: 'name', title:'Pilot'},
+      {data: 'SSS', title:'SS'},
+      {data: 'ESS', title:'ES'},
+      {data: 'time', title:'Time'},
+      {data: 'realdist', title:'real dist', id:'realdist', name:'realdist', visible: false},
+      {data: 'altbonus', title:'alt bonus', id:'altbonus', name:'altbonus', visible: false},
+      {data: 'distance', title:'Kms'},
+      {data: 'speedP', title:'Spd', name:'spd'},
+      {data: 'leadP', title:'LO', id:'leading', name:'leading'},
+      {data: 'arrivalP', title:'Arv', id:'arv', name:'arv'},
+      {data: 'distanceP', title:'Dst'},
+      {data: 'penalty', title:'Pen'},
+      {data: 'score', title:'Tot'},
+      {data: null, title: 'Notifications'},
+      {data: null, title: ""}
+    ],
+    rowId: function(data) {
+      return 'id_' + data.par_id;
+    },
+    columnDefs: [{
+      targets: [-2],  render: function (a, b, data, d) {
+      if (data.notifications){
+        var airspace = '';
+        var track = '';
+        var JTG = '';
+        var admin = '';
+        $.each( data.notifications, function( key, value ) {
+          if (value.notification_type=="airspace"){
+            airspace = 'CTR ';
+          }
+          if (value.notification_type=="track"){
+            track = 'IGC ';
+          }
+          if (value.notification_type=="admin"){
+            admin = 'Admin ';
+          }
+          if (value.notification_type=="jtg"){
+            JTG = 'JTG ';
+          }
+        });
+        return(airspace + track + JTG + admin);
+      }
+      else { return (""); }
+      }},
+      {
+      targets: [-1],  render: function (a, b, data, d) {
+      if ( !external && !task_info.locked ){
+        return ('<td  class ="value" ><button type="button" class="btn btn-primary" onclick="adjust('
+          + data.par_id + ')" data-toggle="confirmation" data-popout="true">Edit</button></td>');
+      }
+      else { return (""); }
+      }}
+    ],
 
-            }},
-            {
-            targets: [-1],  render: function (a, b, data, d) {
-            if (!external){
-                return ('<td  class ="value" ><button type="button" class="btn btn-primary" onclick="adjust('
-                   +  data.par_id + ')" data-toggle="confirmation" data-popout="true">Edit</button></td>');
-            }
-            else { return (""); }
-            }}
-        ],
+    "language": {
+      "emptyTable":     "Error: result file not found"
+    },
+    "initComplete": function(settings, json) {
+      let table = $('#task_result').DataTable();
+      if ( !json.stats.avail_arr_points ){
+        table.column( 'arv:name' ).visible( false );
+      };
+      if ( !json.stats.avail_dep_points ){
+        table.column( 'leading:name' ).visible( false );
+      };
+      if ( !json.stats.avail_time_points ){
+        table.column( 'spd:name' ).visible( false );
+      };
+      if ( json.info.stopped_time ){
+        table.column( 'realdist:name' ).visible( true );
+        table.column( 'altbonus:name' ).visible( true );
+      };
+      score_data = json;
+      $('#taskinfo tbody').empty()
+      $.each( json.stats, function( key, value ) {
+        $('#taskinfo tbody').append('<tr><td>' + key + '</td><td>' + value + '</td></tr>');
+      });
+    }
+  });
+}
 
-        "language": {
-            "emptyTable":     "Error: result file not found"
-        },
-        "initComplete": function(settings, json) {
-            score_data = json;
-                $.each( json.stats, function( key, value ) {
-                $('#taskinfo tbody').append('<tr><td>' + key + '</td><td>' + value + '</td></tr>');
-            });
-        }
-    });
+function get_tracks_processed(){
+  $.ajax({
+    type: "GET",
+    url: '/users/_get_tracks_processed/'+taskid,
+    contentType:"application/json",
+    dataType: "json",
+    success: function (response) {
+      if (response.tracks == response.pilots) {
+        create_flashed_message('All pilots have a valid result for the task', 'success');
+        suggested_status = 'Provisional Results';
+      }
+      else {
+        create_flashed_message((response.pilots - response.tracks)+' pilots do not have a valid result for the task', 'warning');
+        suggested_status = 'Partial Results ('+response.tracks+'/'+response.pilots+' Pilots)';
+      }
+      $('#TracksProcessed').text('Tracks Collected: ' + response.tracks + '/' + response.pilots)
+    }
+  });
 }
 
 function updateFiles(load_latest=false) {
   var mydata = new Object();
   mydata.offset = new Date().getTimezoneOffset();
   task.dropdown.empty().attr('disabled', 'disabled');
-  comp.dropdown.empty().attr('disabled', 'disabled');
 
   $.ajax({
     type: "POST",
@@ -88,54 +122,40 @@ function updateFiles(load_latest=false) {
     data: JSON.stringify(mydata),
     dataType: "json",
     success: function(response) {
-      let sections = [ task, comp ];
-      sections.forEach( el => {
-        let active = response.task_active;
-        let header = response.task_header;
-        let choices = response.task_choices;
-        let iscomp = false;
-        if (el == comp) {
-          console.log('COMP: ');
-          active = response.comp_active;
-          header = response.comp_header;
-          choices = response.comp_choices;
-          iscomp = true;
-        }
-        el.dropdown.empty().attr('disabled', 'disabled');
-        el.header.html(header)
-        if (choices.length == 0) {
-          el.scoring_runs_section.hide();
-        }
-        else {
-          el.scoring_section.show();
-          choices.forEach(function(item) {
-            el.dropdown.append(
-              $('<option>', {
-                value: item[0],
-                text: item[1]
-              })
-            );
-          });
-          if (!external) el.dropdown.removeAttr('disabled');
-          if (active) el.active_file = active;
-          el.latest = el.dropdown.find('option:first').val();
-          if (load_latest || !active) el.dropdown.val(el.latest);
-          else el.dropdown.val(active);
-          el.selected = el.dropdown.find('option:selected').val();
-          array = el.dropdown.find('option:selected').text().split(' - ');
-          el.timestamp = array[0];
-          el.status = array[1];
-          if (el.status && el.status.includes('Auto Generated' )) {
-            el.status = el.status.replace('Auto Generated ', '');
-          }
-          update_buttons(iscomp);
-          console.log('active: '+el.active_file);
-          console.log('selected: '+el.selected);
-          console.log('latest: '+el.latest);
-          console.log('status: '+el.status);
-          console.log('timestamp: '+el.timestamp);
-        }
-      });
+      let active = response.task_active;
+      let header = response.task_header;
+      let choices = response.task_choices;
+      task.dropdown.empty().attr('disabled', 'disabled');
+      task.header.html(header)
+      if (choices.length == 0) {
+        task.scoring_section.hide();
+      }
+      else {
+        task.scoring_section.show();
+        choices.forEach(function(item) {
+          task.dropdown.append(
+            $('<option>', {
+              value: item[0],
+              text: item[1]
+            })
+          );
+        });
+        if (!external) task.dropdown.removeAttr('disabled');
+        if (active) task.active_file = active;
+        task.latest = task.dropdown.find('option:first').val();
+        if (load_latest || !active) task.dropdown.val(task.latest);
+        else task.dropdown.val(active);
+        task.selected = task.dropdown.find('option:selected').val();
+        array = task.dropdown.find('option:selected').text().split(' - ');
+        task.timestamp = array[0];
+        task.status = array[1];
+//        console.log('active: '+task.active_file);
+//        console.log('selected: '+task.selected);
+//        console.log('latest: '+task.latest);
+//        console.log('status: '+task.status);
+//        console.log('timestamp: '+task.timestamp);
+      };
+      update_buttons();
       if (!task.selected) task.results_panel.hide();
       else {
         task.results_panel.show();
@@ -146,21 +166,20 @@ function updateFiles(load_latest=false) {
 }
 
 // Toggle Publish
-function toggle_publish(iscomp=false) {
-  let data = task;
-  if (iscomp) data = comp;
+function toggle_publish() {
   let mydata = {
-    filetext: data.dropdown.find('option:selected').text(),
-    filename: data.dropdown.find('option:selected').val(),
-    iscomp: iscomp,
-    compid: compid
+    filetext: task.dropdown.find('option:selected').text(),
+    filename: task.dropdown.find('option:selected').val(),
+    iscomp: false,
+    compid: compid,
+    taskid: taskid
   }
   let url = '';
-  if (mydata.filename == data.active_file) {
-    url = url_unpublish_result;
+  if (mydata.filename == task.active_file) {
+    url = '/users/_unpublish_result';
   }
   else {
-    url = url_publish_result;
+    url = '/users/_publish_result';
   }
   $.ajax({
     type: "POST",
@@ -169,15 +188,16 @@ function toggle_publish(iscomp=false) {
     data: JSON.stringify(mydata),
     dataType: "json",
     success: function(response) {
-      data.active_file = response.filename;
-      update_buttons(iscomp);
-      data.header.text(response.header);
+      task.active_file = response.filename;
+      update_buttons();
+      task.header.text(response.header);
     }
   });
 }
 
 // Scores
 function Score_modal() {
+  $('#status_comment').val(suggested_status);
   $('#scoremodal').modal('show');
 }
 
@@ -195,11 +215,16 @@ function Score() {
     data: JSON.stringify(mydata),
     dataType: "json",
     success: function(response) {
-      if (production) {
-        $('#scoremodal').modal('hide');
-      }
-      if (response.redirect) {
-        window.location.href = response.redirect;
+      clear_flashed_messages();
+      if ( response.success ){
+        if (production) {
+          $('#scoremodal').modal('hide');
+          create_flashed_message('New scoring file created.', 'success');
+          updateFiles(load_latest=true);
+        }
+        else if (response.redirect) {
+          window.location.href = response.redirect;
+        }
       }
     }
   });
@@ -219,40 +244,22 @@ function FullRescore() {
     data: JSON.stringify(mydata),
     dataType: "json",
     success: function(response) {
+      clear_flashed_messages();
       if (production == false) {
         $('#fullscoremodal').modal('hide');
+        create_flashed_message('All tracks have been processed. New scoring file created.', 'success');
+      }
+      else {
+        create_flashed_message('Processing tracks. Please wait...', 'warning');
       }
     }
   });
 }
 
-function comp_calculate() {
-  var mydata = new Object();
-  mydata.offset = new Date().getTimezoneOffset();
-  $('#comp_calculate').hide();
-  $('#comp_calculate_spinner').html('<div class="spinner-border" role="status"><span class="sr-only">Scoring...</span></div>');
-  $.ajax({
-    type: "POST",
-    url:  url_calculate_comp_result,
-    contentType: "application/json",
-    data: JSON.stringify(mydata),
-    dataType: "json",
-    success: function(response) {
-      updateFiles();
-      $('#comp_calculate_spinner').html('')
-      $('#comp_calculate').show();
-    }
-  });
-}
-
 // Change Status
-function open_status_modal(iscomp=false) {
-  let data = task;
-  if (iscomp) {
-    data = comp;
-  }
-  $('#status_modal_filename').val(data.selected);
-  $('#status_modal_comment').val(data.status);
+function open_status_modal() {
+  $('#status_modal_filename').val(task.selected);
+  $('#status_modal_comment').val(task.status);
   $('#statusmodal').modal('show');
 }
 
@@ -358,7 +365,6 @@ function save_adjustment(par_id){
       data: JSON.stringify(mydata),
       dataType: "json",
       success: function(response) {
-        comp.header.text(response.comp_header)
         populate_task_scores();
         $('#editmodal').modal('hide');
       }
@@ -367,16 +373,11 @@ function save_adjustment(par_id){
 }
 
 // Delete Result
-function delete_result_modal(iscomp=false) {
-  let data = task;
+function delete_result_modal() {
   let title = 'Delete Task Result';
-  if (iscomp) {
-    data = comp;
-    title = 'Delete Comp Result';
-  }
 
-  $('#delete_modal_filename').val(data.selected);
-  let selected = data.dropdown.find('option:selected').text().split(' - ');
+  $('#delete_modal_filename').val(task.selected);
+  let selected = task.dropdown.find('option:selected').text().split(' - ');
   let ran = selected[0];
   let status = selected[1];
   if (!status) status = '<span class="text-secondary">No status</span>';
@@ -386,13 +387,13 @@ function delete_result_modal(iscomp=false) {
   $('#deletemodal').modal('show');
 }
 
-function delete_result(iscomp=false){
+function delete_result(){
   var mydata = new Object();
   mydata.deletefile = $("#deletefile").is(':checked');
   mydata.filename = $('#delete_modal_filename').val();
   $.ajax({
     type: "POST",
-    url:  '/users/_delete_task_result/'+taskid,
+    url:  '/users/_delete_task_result',
     contentType: "application/json",
     data: JSON.stringify(mydata),
     dataType: "json",
@@ -404,97 +405,89 @@ function delete_result(iscomp=false){
 }
 
 // Functions
-function get_preview_url(iscomp=false) {
+function get_preview_url() {
   let file = task.selected;
   let url = '/task_result/'+taskid;
-  if (iscomp) {
-    file = comp.selected;
-    url = '/comp_result/'+compid;
-  }
   url += '?file='+file;
   return url
 }
 
-function get_status(data){
-  let array = data.dropdown.find('option:selected').text().split(' - ');
-  data.timestamp = array[0];
-  data.status = array[1];
-  if (data.status && data.status.includes('Auto Generated' )) {
-    data.status = data.status.replace('Auto Generated ', '');
-  }
+function get_status(){
+  let array = task.dropdown.find('option:selected').text().split(' - ');
+  task.timestamp = array[0];
+  task.status = array[1];
 }
 
 function ismissing(status){
   if (status == 'FILE NOT FOUND') return true; else return false;
 }
 
-function update_publish_button(iscomp=false) {
-  let data = task;
-  if (iscomp) data = comp;
-
-  if (data.selected == data.active_file) {
-    data.publish.text('Un-Publish results');
-    data.publish.addClass('btn-warning').removeClass('btn-success');
+function update_publish_button() {
+  if (task.selected == task.active_file) {
+    task.publish.text('Un-Publish results');
+    task.publish.addClass('btn-warning').removeClass('btn-success');
   }
   else {
-    data.publish.text('Publish results');
-    data.publish.addClass('btn-success').removeClass('btn-warning');
+    task.publish.text('Publish results');
+    task.publish.addClass('btn-success').removeClass('btn-warning');
   }
 }
 
-function check_active(iscomp=false) {
-  let data = task;
+function check_active() {
   let html = 'task_html';
-  let filename = data.active_file;
-  if (iscomp) {
-    data = comp;
-    html = 'comp_html';
-    filename = compid;
-    }
-  if (data.active_file) {
-    data.download_html.attr('onclick', "location.href='/users/_download/"+html+"/"+filename+"'");
-    data.download_html.show();
+  let filename = task.active_file;
+
+  if (task.active_file) {
+    task.download_html.attr('onclick', "location.href='/users/_download/"+html+"/"+filename+"'");
+    task.download_html.show();
     // check file exists
-    if (data.dropdown.find('option[value="'+data.active_file+'"]').text().includes('FILE NOT FOUND')){
-      data.download_html.prop('disabled', true);
+    if (task.dropdown.find('option[value="'+task.active_file+'"]').text().includes('FILE NOT FOUND')){
+      task.download_html.prop('disabled', true);
     }
-    else data.download_html.prop('disabled', false);
+    else task.download_html.prop('disabled', false);
   }
   else {
-    data.download_html.attr('onclick', "");
-    data.download_html.hide();
+    task.download_html.attr('onclick', "");
+    task.download_html.hide();
   }
 }
 
-function update_buttons(iscomp=false) {
-  let data = task;
-  if (iscomp) data = comp;
-
-  if (ismissing(data.status)) {
-    data.publish.text('Publish results');
-    data.publish.addClass('btn-secondary').removeClass('btn-success').removeClass('btn-warning');
-    data.publish.prop('disabled', true);
-    data.change_status.addClass('btn-secondary').removeClass('btn-primary');
-    data.change_status.prop('disabled', true);
-    data.preview.addClass('btn-secondary').removeClass('btn-primary');
-    data.preview.removeAttr('onclick');
-    data.preview.prop('disabled', true);
+function update_buttons() {
+  if ( task_info.locked ) {
+    task.publish.text('Locked');
+    task.publish.addClass('btn-secondary').removeClass('btn-success').removeClass('btn-warning');
+    task.publish.prop('disabled', true);
+    task.change_status.removeClass('btn-secondary').addClass('btn-primary');
+    task.change_status.prop('disabled', false);
+    task.preview.removeClass('btn-secondary').addClass('btn-primary');
+    task.preview.attr('onclick', "window.open('"+ get_preview_url()+"','preview')");
+    task.preview.prop('disabled', false);
+  }
+  else if (ismissing(task.status)) {
+    task.publish.text('Publish results');
+    task.publish.addClass('btn-secondary').removeClass('btn-success').removeClass('btn-warning');
+    task.publish.prop('disabled', true);
+    task.change_status.addClass('btn-secondary').removeClass('btn-primary');
+    task.change_status.prop('disabled', true);
+    task.preview.addClass('btn-secondary').removeClass('btn-primary');
+    task.preview.removeAttr('onclick');
+    task.preview.prop('disabled', true);
   }
   else {
-    data.publish.removeClass('btn-secondary');
-    data.publish.prop('disabled', false);
-    update_publish_button(iscomp);
-    data.change_status.removeClass('btn-secondary').addClass('btn-primary');
-    data.change_status.prop('disabled', false);
-    data.preview.removeClass('btn-secondary').addClass('btn-primary');
-    data.preview.attr('onclick', "window.open('"+ get_preview_url(iscomp)+"','preview')");
-    data.preview.prop('disabled', false);
+    task.publish.removeClass('btn-secondary');
+    task.publish.prop('disabled', false);
+    update_publish_button();
+    task.change_status.removeClass('btn-secondary').addClass('btn-primary');
+    task.change_status.prop('disabled', false);
+    task.preview.removeClass('btn-secondary').addClass('btn-primary');
+    task.preview.attr('onclick', "window.open('"+ get_preview_url()+"','preview')");
+    task.preview.prop('disabled', false);
   }
-  if (external || (data.selected == data.active_file && !ismissing(data.status)) || data.selected.includes('Overview')){
-    data.delete_file.prop('disabled', true);
+  if (external || (task.selected == task.active_file && !ismissing(task.status)) || task.selected.includes('Overview')){
+    task.delete_file.prop('disabled', true);
   }
-  else data.delete_file.prop('disabled', false);
-  check_active(iscomp);
+  else task.delete_file.prop('disabled', false);
+  check_active();
 }
 
 
@@ -504,7 +497,7 @@ table_data = [];
 
 // jQuery selection for the file select box
 var task = {
-  dropdown: $('#task_result_file'),
+  dropdown: $('select[name="task_result_file"]'),
   delete_file: $('#delete_result'),
   publish: $('#publish'),
   change_status: $('#change_status'),
@@ -513,6 +506,7 @@ var task = {
   header: $("#task_result_header"),
   scoring_section: $('#scoring_runs_section'),
   results_panel: $('#task_results_panel'),
+  lock_switch: $('#lock_task_button'),
   active_file: '',
   selected: '',
   latest: '',
@@ -520,23 +514,14 @@ var task = {
   status: ''
 };
 
-var comp = {
-  dropdown: $('#comp_result_file'),
-  delete_file: $('#delete_comp_result'),
-  publish: $('#comp_publish'),
-  change_status: $('#change_comp_status'),
-  download_html: $('#download_comp_html'),
-  preview: $('#comp_preview'),
-  header: $('#comp_header'),
-  scoring_section: $('#comp_scoring_runs_section'),
-  active_file: '',
-  selected: '',
-  latest: '',
-  timestamp: '',
-  status: ''
-};
+var suggested_status = '';
 
 $(document).ready(function() {
+  if (task_info.locked) {
+    suggested_status = 'Official Results';
+  }
+  else get_tracks_processed();
+
   updateFiles();
 
   // Event listener to the file picker to redraw on input
@@ -547,10 +532,20 @@ $(document).ready(function() {
     populate_task_scores();
   });
 
-  comp.dropdown.change(function() {
-    comp.selected = comp.dropdown.find('option:selected').val();
-    get_status(comp);
-    update_buttons(iscomp=true);
+  task.lock_switch.click( function() {
+    let mydata = {
+      locked: task_info.locked
+    }
+    $.ajax({
+      type: "POST",
+      url:  '/users/_task_lock_switch/'+taskid,
+      contentType: "application/json",
+      data: JSON.stringify(mydata),
+      dataType: "json",
+      success: function(response) {
+        window.location.reload(true);
+      }
+    });
   });
 
   function initES() {
@@ -578,11 +573,15 @@ $(document).ready(function() {
 
       es.addEventListener('reload', function(event) {
         task.selected = task.dropdown.find('option:selected').val();
-        populate_task_scores();
+        clear_flashed_messages();
+        updateFiles();
+        create_flashed_message('All tracks have been processed. New scoring file created.', 'success');
       }, false);
 
       es.addEventListener('reload_select_latest', function(event) {
+        clear_flashed_messages();
         updateFiles(load_latest=true);
+        create_flashed_message('All tracks have been processed. New scoring file created.', 'success');
       }, false);
     }
   }

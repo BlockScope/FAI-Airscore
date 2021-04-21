@@ -1,9 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from functools import partial
 from math import log, pow, sqrt
 
 import geopy
 import pyproj
+from db.tables import TblAirspaceCheck as A
 from airspaceUtils import read_airspace_check_file
 from route import Turnpoint, distance
 from shapely import ops
@@ -38,7 +39,7 @@ class CheckParams:
 
     def penalty(self, distance, direction) -> float:
         """calculate penalty based on params
-        distance: FLOAT distance in meters
+        distance: FLOAT distance from airspace border in meters
         direction: 'h' or 'v'"""
         if not distance or (
             (direction == 'h' and distance >= self.h_outer_limit)
@@ -119,7 +120,7 @@ class AirspaceCheck(object):
             return None
         task_id = task.task_id
         control_area = read_airspace_check_file(task.openair_file)
-        params = get_airspace_check_parameters(task_id)
+        params = get_airspace_check_parameters(task.comp_id, task_id)
         airspace = AirspaceCheck(control_area, params, task.geo)
         airspace.get_airspace_details(qnh=task.QNH)
         return airspace
@@ -295,7 +296,7 @@ class AirspaceCheck(object):
             separation = fix[6]
             if pen == 0:
                 ''' create warning comment'''
-                comment = f"[{space}] Warning: {separation}. separation less than {dist} meters"
+                comment = f"[{space}] Warning: {separation}. separation less than {round(dist)} meters"
             else:
                 '''add fix to infringements'''
                 infringements_per_space.append(
@@ -322,11 +323,11 @@ class AirspaceCheck(object):
         return infringements_per_space, notifications, penalty
 
 
-def get_airspace_check_parameters(task_id):
-    from db.tables import TaskAirspaceCheckView as A
+def get_airspace_check_parameters(comp_id: int, task_id: int = None) -> CheckParams or None:
+    from db.tables import TblAirspaceCheck as A
 
-    q = A.get_by_id(task_id)
-    if q.airspace_check:
+    q = A.get_one(comp_id=comp_id, task_id=task_id) or A.get_one(comp_id=comp_id, task_id=None)
+    if q:
         '''calculate parameters'''
         h_outer_band = q.h_outer_limit - q.h_boundary
         h_inner_band = q.h_boundary - q.h_inner_limit
@@ -370,6 +371,28 @@ def get_airspace_check_parameters(task_id):
     else:
         print(f"airspace_check disabled")
         return None
+
+
+def save_airspace_check_parameters(param: CheckParams, comp_id: int, task_id: int = None):
+    row = A.get_one(comp_id=comp_id, task_id=task_id)
+    if row:
+        row.update(**asdict(param))
+    else:
+        row = A.from_obj(param)
+        row.comp_id = comp_id
+        row.task_id = task_id
+        row.save()
+
+
+def create_check_parameters(comp_id: int, task_id: int = None):
+    if task_id:
+        row = A.get_one(comp_id=comp_id, task_id=None)
+        params = A(**row.as_dict())
+        params.check_id = None
+        params.task_id = task_id
+    else:
+        params = A(comp_id=comp_id)
+    params.save()
 
 
 def fl_to_meters(flight_level, qnh=1013.25):

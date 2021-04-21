@@ -25,23 +25,13 @@ Stuart Mackintosh - Antonio Golfari
 
 import json
 from collections import Counter
-from os import makedirs, path
-
+from pathlib import Path
 from airspace import AirspaceCheck
-from calcUtils import sec_to_time, string_to_seconds
+from calcUtils import string_to_seconds
 from db.conn import db_session
 from db.tables import TblTaskResult
 from Defines import MAPOBJDIR
 from formulas.libs.leadcoeff import LeadCoeff
-from route import (
-    distance_flown,
-    get_shortest_path,
-    in_goal_sector,
-    start_made_civl,
-    tp_made_civl,
-    tp_time_civl,
-)
-
 from .notification import Notification
 from .participant import Participant
 from .waypointachieved import WaypointAchieved
@@ -231,7 +221,9 @@ class FlightResult(Participant):
         else:
             result.track_file = fdata.get('tracklog_filename')
             result.result_type = 'lo'
-        result.real_start_time = None if not fdata.get('started_ss') else string_to_seconds(fdata.get('started_ss')) - offset
+        result.real_start_time = (
+            None if not fdata.get('started_ss') else string_to_seconds(fdata.get('started_ss')) - offset
+        )
         result.last_altitude = float(fdata.get('last_tracklog_point_alt') or 0)
         result.max_altitude = int(fdata.get('max_alt') if fdata.get('max_alt') is not None else 0)
         result.track_file = fdata.get('tracklog_filename')
@@ -246,13 +238,17 @@ class FlightResult(Participant):
             result.distance_flown = float(fres.get('real_distance')) * 1000  # in meters
             result.SSS_time = None if not fres.get('started_ss') else string_to_seconds(fres.get('started_ss')) - offset
             if result.SSS_time is not None:
-                result.ESS_time = None if not fres.get('finished_ss') else string_to_seconds(fres.get('finished_ss')) - offset
+                result.ESS_time = (
+                    None if not fres.get('finished_ss') else string_to_seconds(fres.get('finished_ss')) - offset
+                )
                 if task.SS_distance is not None and result.ESS_time is not None and result.ESS_time > 0:
                     result.speed = (task.SS_distance / 1000) / ((result.ESS_time - result.SSS_time) / 3600)
                     result.ESS_rank = None if not fres.get('finished_ss_rank') else int(fres.get('finished_ss_rank'))
                 if fdata.get('reachedGoal') == "1" or (result.ESS_time and task.fake_goal_turnpoint):
                     result.goal_time = (
-                        None if not fdata.get('finished_task') else string_to_seconds(fdata.get('finished_task')) - offset
+                        None
+                        if not fdata.get('finished_task')
+                        else string_to_seconds(fdata.get('finished_task')) - offset
                     )
                     result.result_type = 'goal'
             else:
@@ -499,7 +495,6 @@ class FlightResult(Participant):
         """save tracklog map result file in the correct folder as defined by DEFINES"""
         from pathlib import Path
 
-        # res_path = f"{MAPOBJDIR}tracks/{taskid}/"
         res_path = Path(MAPOBJDIR, 'tracks', str(taskid))
         """check if directory already exists"""
         if not res_path.is_dir():
@@ -534,10 +529,11 @@ def verify_all_tracks(task, lib, airspace=None, print=print):
     task:       Task object
     lib:        Formula library module"""
     from pathlib import Path
-
+    from trackUtils import igc_parsing_config_from_yaml
     from igc_lib import Flight
 
     pilots = [p for p in task.pilots if p.result_type not in ('abs', 'dnf', 'mindist') and p.track_file]
+
     '''check if any track is missing'''
     if any(not Path(task.file_path, p.track_file).is_file() for p in pilots):
         print(f"The following tracks are missing from folder {task.file_path}:")
@@ -547,14 +543,15 @@ def verify_all_tracks(task, lib, airspace=None, print=print):
 
     print('getting tracks...')
     number_of_pilots = len(task.pilots)
+    FlightParsingConfig = igc_parsing_config_from_yaml(task.igc_config_file)
+
     for track_number, pilot in enumerate(task.pilots, 1):
         print(f"{track_number}/{number_of_pilots}|track_counter")
-        # print(f"type: {pilot.result_type}")
         if pilot.result_type not in ('abs', 'dnf', 'mindist') and pilot.track_file:
             print(f"{pilot.ID}. {pilot.name}: ({pilot.track_file})")
             filename = Path(task.file_path, pilot.track_file)
             '''load track file'''
-            flight = Flight.create_from_file(filename)
+            flight = Flight.create_from_file(filename, config_class=FlightParsingConfig)
             if flight:
                 pilot.flight_notes = flight.notes
                 if flight.valid:
@@ -580,7 +577,7 @@ def adjust_flight_results(task, lib, airspace=None):
                 pilot.ESS_time and pilot.ss_time > maxtime
             ):
                 '''need to adjust pilot result'''
-                filename = path.join(task.file_path, pilot.track_file)
+                filename = Path(task.file_path, pilot.track_file)
                 '''load track file'''
                 flight = Flight.create_from_file(filename)
                 pilot.check_flight(flight, task, airspace_obj=airspace, deadline=last_time)
@@ -616,31 +613,44 @@ def delete_track(trackid: int, delete_file=False):
     return row_deleted
 
 
-def get_task_results(task_id: int):
-    from db.tables import FlightResultView as F
-    from db.tables import TblNotification as N
-    from db.tables import TblTaskResult as R
-    from db.tables import TblTrackWaypoint as W
+def get_task_results(task_id: int) -> list:
+    from db.tables import TblNotification as N, TblTaskResult as R, TblTrackWaypoint as W
     from pilot.notification import Notification
 
-    pilots = []
-    results = R.get_task_results(task_id)
-    track_list = list(filter(None, map(lambda x: x.track_id, results)))
+    pilots = [R.populate(p, FlightResult()) for p in R.get_task_results(task_id)]
+    track_list = list(filter(None, map(lambda x: x.track_id, pilots)))
     notifications = N.from_track_list(track_list)
     achieved = W.get_dict_list(track_list)
-    for row in results:
-        p = FlightResult.from_dict(row._asdict())
-        if not row.result_type:
-            p.result_type = 'nyp'
-        for el in [n for n in notifications if n.track_id == p.track_id]:
-            n = Notification()
-            el.populate(n)
-            p.notifications.append(n)
-        if p.result_type in ('lo', 'goal'):
-            wa = list(filter(lambda x: x['track_id'] == p.track_id, achieved))
-            for el in wa:
-                p.waypoints_achieved.append(WaypointAchieved.from_dict(el))
-        pilots.append(p)
+    for pilot in pilots:
+        if not pilot.result_type:
+            pilot.result_type = 'nyp'
+        else:
+            pil_notif = list(filter(lambda x: x.track_id == pilot.track_id, notifications))
+            if pil_notif:
+                pilot.notifications = [el.populate(Notification()) for el in pil_notif]
+                notifications = list(filter(lambda x: x not in pil_notif, notifications))
+            if pilot.result_type in ('lo', 'goal'):
+                wa = list(filter(lambda x: x['track_id'] == pilot.track_id, achieved))
+                if wa:
+                    pilot.waypoints_achieved = [WaypointAchieved.from_dict(el) for el in wa]
+                    achieved = list(filter(lambda x: x not in wa, achieved))
+    return pilots
+
+
+def get_task_pilots(task_id: int, comp_id: int = None) -> list:
+    """ Loads FlightResult obj. with only Participants info into Task obj."""
+    from db.tables import TblTask as T, TblTaskResult as R
+    from compUtils import get_participants
+
+    if not comp_id:
+        comp_id = T.get_by_id(task_id).comp_id
+    pilots = [FlightResult.from_participant(p) for p in get_participants(comp_id)]
+    tracks = R.get_all(task_id=task_id)
+    if tracks:
+        for p in pilots:
+            res = next((x for x in tracks if x.par_id == p.par_id), None)
+            if res:
+                p.track_id, p.track_file, p.result_type = res.track_id, res.track_file, res.result_type
     return pilots
 
 

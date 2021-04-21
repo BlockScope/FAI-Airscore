@@ -23,6 +23,8 @@ import json
 from db.conn import db_session
 from db.tables import TblResultFile
 from sqlalchemy import and_
+from Defines import RESULTDIR
+from pathlib import Path
 
 
 class TaskResult:
@@ -56,6 +58,7 @@ class TaskResult:
         'SS_distance',
         'stopped_time',
         'goal_altitude',
+        'locked'
     ]
 
     route_list = ['name', 'description', 'how', 'radius', 'shape', 'type', 'lat', 'lon', 'altitude']
@@ -138,6 +141,7 @@ class TaskResult:
         'civl_id',
         'fai_id',
         'name',
+        'birthdate',
         'sponsor',
         'nat',
         'sex',
@@ -179,6 +183,7 @@ class TaskResult:
         'flight_time',
         'track_file',
         'pil_id',
+        'custom'
     ]
 
     @staticmethod
@@ -188,16 +193,15 @@ class TaskResult:
 
         from frontendUtils import get_pretty_data
 
-        res = get_pretty_data(open_json_file(json_file))
+        res = get_pretty_data(open_json_file(json_file), export=True)
         comp_name = res['info']['comp_name']
         task_name = res['info']['task_name']
         task_code = f"T{res['info']['task_num']}"
-        if len(res['classes']) > 0:
-            classes = res['classes']
+        rankings = res['rankings']
+        if len(rankings) > 1:
             zipfile = f"{re.sub(r'[ ,.-]', '_', comp_name)}_{task_code}.zip"
         else:
             zipfile = False
-            classes = [{'name': ''}]
 
         '''Task Route table'''
         right_align = [2, 3]
@@ -253,8 +257,8 @@ class TaskResult:
         res_align.append(len(thead) - 1)
 
         response = []
-        for idx, c in enumerate(classes):
-            class_name = comp_name if not c['name'] else f"{comp_name} {c['name']}"
+        for idx, c in enumerate(rankings):
+            class_name = comp_name if not c['rank_name'] else f"{comp_name} {c['rank_name']}"
             title = f"{class_name} - {task_name}"
             filename = f"{re.sub(r'[ ,.-]', '_', class_name)}_{task_code}.html"
 
@@ -263,35 +267,23 @@ class TaskResult:
             task_type = f"{res['info']['task_type'].title()} {dist}"
             headings = [class_name, task_name, res['info']['date'], task_type, res['file_stats']['status']]
 
-            if idx > 0:
-                ''' manage sub-rankings'''
-                pilots = [p for p in res['results'] if p['glider_cert'] in c['cert']]
-                keys = [c['limit'], 'ID', 'name', 'nat', 'glider', 'sponsor']
-            else:
-                pilots = [p for p in res['results']]
-                keys = ['rank', 'ID', 'name', 'nat', 'glider', 'sponsor']
+            pilots = [p for p in res['results'] if p['rankings'][c['rank_id']]]
+            keys = [c['rank_id'], 'ID', 'name', 'nat', 'glider', 'sponsor']
             keys.extend(results_keys)
 
             '''Main results table body'''
             tbody = []
             for p in [x for x in pilots if x['result_type'] not in ['abs', 'nyp', 'dnf']]:
-                if idx == 0:
-                    if p['ESS_time'] and not p['goal_time']:
-                        p['ESS_time'] = f"<del>{p['ESS_time']}</del>"
-                        p['ss_time'] = f"<del>{p['ss_time']}</del>"
-                        p['speed'] = f"<del>{p['speed']}</del>"
-                    if float(p['penalty']) > 0:
-                        p['score'] = f"<span style='color:red'>*{p['score']}</span>"
-                tbody.append([p[k] for k in keys])
+                tbody.append([p['rankings'][k] if i == 0 else p[k] for i, k in enumerate(keys)])
             results = dict(css_class='results', right_align=res_align, thead=thead, tbody=tbody)
 
             tables = [route, times, results]
 
             ''' Comments Table'''
-            if any(p for p in pilots if float(p['penalty'] or 0) != 0):
+            if any(p for p in pilots if p['penalty']):
                 comments = []
                 right_align = [0]
-                for p in [x for x in pilots if float(x['penalty'] or 0) != 0]:
+                for p in [x for x in pilots if x['penalty']]:
                     comments.append([p['ID'], p['name'], p['nat'], p['comment']])
                 comments = dict(title='Penalties:', css_class='results', right_align=right_align, tbody=comments)
                 tables.append(comments)
@@ -404,6 +396,7 @@ class CompResult(object):
         'glide_bonus',
         'tolerance',  # percentage / 100
         'scoring_altitude',  # 'GPS', 'QNH'
+        'task_result_decimal',
         'comp_result_decimal',
         'team_scoring',
         'team_size',
@@ -426,6 +419,7 @@ class CompResult(object):
         'ftv_validity',
         'max_score',
         'task_type',
+        'locked'
     ]
 
     ''' result_list comes from Participant obj, and RegisteredPilotView
@@ -437,6 +431,7 @@ class CompResult(object):
         'civl_id',
         'fai_id',
         'name',
+        'birthdate',
         'sex',
         'nat',
         'glider',
@@ -448,6 +443,7 @@ class CompResult(object):
         'pil_id',
         'score',
         'results',
+        'custom'
     ]
 
     @staticmethod
@@ -457,14 +453,13 @@ class CompResult(object):
 
         from frontendUtils import get_pretty_data
 
-        res = get_pretty_data(open_json_file(json_file))
+        res = get_pretty_data(open_json_file(json_file), export=True)
         comp_name = f"{res['info']['comp_name']}"
-        if len(res['classes']) > 0:
-            classes = res['classes']
+        rankings = res['rankings']
+        if len(res['rankings']) > 1:
             zipfile = f"{re.sub(r'[ ,.-]', '_', comp_name)}_after_{res['tasks'][-1]['task_code']}.zip"
         else:
             zipfile = False
-            classes = [{'name': ''}]
 
         '''Tasks table'''
         tasks = []
@@ -488,30 +483,25 @@ class CompResult(object):
             right_align.append(len(thead) - 1)
 
         response = []
-        for idx, c in enumerate(classes):
-            title = comp_name if not c['name'] else f"{comp_name} {c['name']}"
+        for idx, c in enumerate(rankings):
+            title = comp_name if not c['rank_name'] else f"{comp_name} {c['rank_name']}"
             filename = f"{re.sub(r'[ ,.-]', '_', title)}_after_{res['tasks'][-1]['task_code']}.html"
 
             '''HTML headings'''
             headings = [
                 f"{res['info']['comp_name']} - {res['info']['sanction']} Event",
-                f"{c['name']}",
+                f"{c['rank_name']}",
                 f"{res['info']['date_from']} to {res['info']['date_to']}",
                 f"{res['info']['comp_site']}",
                 f"{res['file_stats']['status']}",
             ]
 
-            if idx > 0:
-                ''' manage sub-rankings'''
-                pilots = [p for p in res['results'] if p['glider_cert'] in c['cert']]
-                keys = [c['limit'], 'ID', 'name', 'nat', 'glider', 'sponsor', 'score']
-            else:
-                pilots = [p for p in res['results']]
-                keys = ['rank', 'ID', 'name', 'nat', 'glider', 'sponsor', 'score']
+            pilots = [p for p in res['results'] if p['rankings'][c['rank_id']]]
+            keys = [c['rank_id'], 'ID', 'name', 'nat', 'glider', 'sponsor', 'score']
 
             tbody = []
             for p in pilots:
-                row = [p[k] for k in keys]
+                row = [p['rankings'][k] if i == 0 else p[k] for i, k in enumerate(keys)]
                 for t in res['tasks']:
                     code = t['task_code']
                     pre, score = p['results'][code]['pre'], p['results'][code]['score']
@@ -547,7 +537,6 @@ def create_json_file(comp_id, code, elements, task_id=None, status=None, name_su
     from time import time
 
     from calcUtils import CJsonEncoder
-    from Defines import RESULTDIR
 
     timestamp = int(time())  # timestamp of generation
     dt = datetime.fromtimestamp(timestamp).strftime('%Y%m%d_%H%M%S')
@@ -558,7 +547,7 @@ def create_json_file(comp_id, code, elements, task_id=None, status=None, name_su
 
     '''adding data section to the elements, with:
         timestamp, status'''
-    result = {'file_stats': {'timestamp': timestamp, 'status': status}}
+    result = {'file_stats': {'result_type': 'task' if task_id else 'comp', 'timestamp': timestamp, 'status': status}}
     result.update(elements)
 
     '''creating json formatting'''
@@ -603,11 +592,8 @@ def publish_result(filename_or_refid, ref_id=False):
     return 1
 
 
-def update_result_status(filename: str, status: str):
+def update_result_status(filename: str, status: str, locked: bool = None):
     import time
-    from pathlib import Path
-
-    from Defines import RESULTDIR
 
     '''check if json file exists, and updates it'''
     file = Path(RESULTDIR, filename)
@@ -619,6 +605,8 @@ def update_result_status(filename: str, status: str):
         d = json.load(f)
         d['file_stats']['status'] = status
         d['file_stats']['last_update'] = int(time.time())
+        if locked is not None:
+            d['info']['locked'] = int(locked)
         f.seek(0)
         f.write(json.dumps(d))
         f.truncate()
@@ -627,6 +615,26 @@ def update_result_status(filename: str, status: str):
         with db_session() as db:
             result = db.query(TblResultFile).filter_by(filename=filename).one()
             result.status = status
+
+
+def update_tasks_status_in_comp_result(comp_id: int) -> bool:
+    """gets status for active tasks result files and writes them in active comp result file"""
+    from compUtils import get_comp_json_filename
+    from task import get_task_json
+    try:
+        file = Path(RESULTDIR, get_comp_json_filename(comp_id))
+        with open(file, 'r+') as f:
+            d = json.load(f)
+            for t in d.get('tasks'):
+                file = get_task_json(t['id'])
+                t['status'] = file['file_stats']['status']
+                t['locked'] = file['info'].get('locked') or 0
+            f.seek(0)
+            f.write(json.dumps(d))
+            f.truncate()
+        return True
+    except Exception:
+        return False
 
 
 def update_result_file(filename: str, par_id: int, notification: dict):
@@ -638,10 +646,7 @@ def update_result_file(filename: str, par_id: int, notification: dict):
                     }
     """
     import time
-    from pathlib import Path
-
     from db.tables import TblNotification as N
-    from Defines import RESULTDIR
 
     file = Path(RESULTDIR, filename)
     if not file.is_file():
@@ -737,11 +742,32 @@ def update_result_file(filename: str, par_id: int, notification: dict):
                 return error
 
 
+def update_results_rankings(comp_id: int, comp_class: str = None) -> bool:
+    """ Updates rankings list in results json files of a comp if rankings are changed """
+    from ranking import create_rankings
+    from calcUtils import CJsonEncoder
+
+    with db_session() as db:
+        files = [Path(RESULTDIR, res.filename) for res in db.query(TblResultFile).filter_by(comp_id=comp_id)
+                 if Path(RESULTDIR, res.filename).is_file()]
+    if files:
+        rankings = create_rankings(comp_id, comp_class)
+        try:
+            for file in files:
+                with open(file, 'r+') as f:
+                    data = json.load(f)
+                    data['rankings'] = rankings
+                    f.seek(0)
+                    f.write(json.dumps(data, cls=CJsonEncoder))
+                    f.truncate()
+            return True
+        except Exception as e:
+            # raise
+            print(f'Error updating result file: {str(e.__dict__)}')
+            return False
+
+
 def delete_result(filename: str, delete_file=False):
-    from pathlib import Path
-
-    from Defines import RESULTDIR
-
     if delete_file:
         Path(RESULTDIR, filename).unlink(missing_ok=True)
     row = TblResultFile.get_one(filename=filename)
@@ -764,10 +790,7 @@ def get_country_list(countries: set = None, iso: int = None) -> list:
 
 
 def open_json_file(filename: str):
-    from pathlib import Path
-
     import jsonpickle
-    from Defines import RESULTDIR
 
     try:
         with open(Path(RESULTDIR, filename), 'r') as f:
@@ -828,7 +851,7 @@ def pretty_format_results(content, timeoffset=0, td=0, cd=0):
                     elif str(key) in duration:
                         '''formatting duration'''
                         formatted[key] = sec_to_duration(int(value))
-                    elif 'timestamp' in key:
+                    elif 'timestamp' in str(key):
                         '''formatting timestamp'''
                         formatted[key] = epoch_to_string(int(value), timeoffset)
                     # Formatting Waypoints Table
@@ -863,6 +886,9 @@ def pretty_format_results(content, timeoffset=0, td=0, cd=0):
                         else:
                             '''name and description'''
                             formatted[key] = str(value)
+                    # Formatting Altitudes
+                    elif str(key).endswith('_altitude'):
+                        formatted[key] = '' if not value else int(value)
                     # Formatting Text
                     elif key in upper:
                         '''formatting uppercase text'''
@@ -879,21 +905,15 @@ def pretty_format_results(content, timeoffset=0, td=0, cd=0):
                         '''formatting formula weight'''
                         formatted[key] = f"{c_round(float(value), 3):.3f}"
                     elif str(key).endswith(scores):
-                        '''formatting scores'''
-                        formatted[key] = f"{c_round(float(value), 1):.1f}"
-                    elif key == 'score':
-                        # TODO need to decide which rounding to use and has to be the same in comp results
-                        # guess scores parts' decimals should be 1 more of final score decimals?
-                        # changed comp results to be consistent with task results, but string formatting is rounding Half Even, should use something as below
-                        # formatted[key] = f"{c_round(float(value) or 0, td):.{td}f}"
-                        formatted[key] = f"{c_round(float(value), 1):.{td}f}"
+                        '''formatting partial scores'''
+                        formatted[key] = f"{c_round(float(value), 1):.1f}" if value else ""
                     elif key == 'speed':
                         formatted[key] = '' if float(value) == 0 else f"{c_round(float(value), 1):.1f}"
                     # Formatting Distances
                     elif key in ['distance', 'distance_flown', 'stopped_distance']:
                         '''formatting distance without unit of measure'''
                         formatted[key] = f"{c_round(float(value) / 1000, 2):.2f}"
-                    elif 'dist' in key:
+                    elif 'dist' in str(key):
                         '''formatting distances with unit of measure'''
                         formatted[key] = f"{c_round(float(value) / 1000, 1):.1f} Km"
                     # Formatting Booleans

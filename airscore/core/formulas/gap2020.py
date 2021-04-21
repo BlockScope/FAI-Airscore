@@ -1,7 +1,7 @@
 """
 Scoring Formula Script
     Defines a Scoring formula. Gets Parameters and jobs from Formula Libraries in libs folder or contains new ones.
-    Name of primary functions has to be mantained:
+    Name of primary functions has to be maintained:
         - process_result : jobs done of FlightResult obj. before scoring
         - points_allocation : main function called to calculate scoring
     Defines which classes formula applies
@@ -10,6 +10,7 @@ Scoring Formula Script
 from formula import FormulaPreset, Preset
 from formulas.libs.gap import *
 from formulas.libs.leadcoeff import *
+from formulas import lclib
 
 ''' Formula Info'''
 # Formula Name: usually the filename in capital letters
@@ -113,7 +114,7 @@ hg_preset = FormulaPreset(
     # Type of Total Validity: ftv, all
     overall_validity=Preset(value='all', visible=True, editable=True),
     # FTV Parameter
-    validity_param=Preset(value=None, visible=True, editable=True),
+    validity_param=Preset(value=1, visible=True, editable=True),
     # FTV Parameter Reference: day_quality, max_score
     validity_ref=Preset(value='max_score', visible=True, editable=True),
     # Penalty when ESS but not Goal: default is 1 for PG and 0.2 for HG
@@ -127,7 +128,7 @@ hg_preset = FormulaPreset(
     # Scoring Altitude Type: default is GPS for PG and QNH for HG
     scoring_altitude=Preset(value='QNH', visible=True, editable=True),
     # Decimals to be displayed in Task results: default is 0
-    task_result_decimal=Preset(value=0, visible=False, editable=False),
+    task_result_decimal=Preset(value=1, visible=False, editable=False),
     # Decimals to be displayed in Comp results: default is 0
     comp_result_decimal=Preset(value=0, visible=False, editable=False),
 )
@@ -287,11 +288,14 @@ def pilot_speed(task, res):
     to complete the speed section. Slow pilots will get zero points for speed if their time to complete the
     speed section is equal to or longer than the fastest time plus the square root of the fastest time.
     All times are measured in hours.
+
+    GAP2020 has been amended. V2.0 has same formula for both HG and PG:
+    SF = max(0, 1 - ((Ptime - MinTime)/sqrt(MinTime))**(5/6))
     """
     if not res.ESS_time:
         return 0
     Aspeed = task.avail_time_points
-    comp_class = task.comp_class  # HG / PG
+
     # 11.2 Time points
     ''' min speed section time
         If no goal penalty = 100% (PG): min ss_time if goal
@@ -300,74 +304,37 @@ def pilot_speed(task, res):
         Tmin = task.fastest / 3600  # decimal hours
     else:
         Tmin = task.fastest_in_goal / 3600 or 0
+
     Ptime = res.ss_time / 3600  # decimal hours
-    if comp_class == 'HG':
-        SF = max(0, 1 - ((Ptime - Tmin) / sqrt(Tmin)) ** (2 / 3))
-    else:
-        print(f'comp class = {comp_class}, using 5/6')
-        SF = max(0, 1 - ((Ptime - Tmin) / sqrt(Tmin)) ** (5 / 6))
+    SF = max(0, 1 - ((Ptime - Tmin) / sqrt(Tmin)) ** (5 / 6))
     Pspeed = Aspeed * SF - task.time_points_reduction if SF > 0 else 0
+
     return Pspeed
 
 
-def weightRising(p):
-    return (1 - 10 ** (9 * p - 9)) ** 5
-
-
-def weightFalling(p):
-    return (1 - 10 ** (-3 * p)) ** 2
-
-
-def weight_calc(dist_to_ess, ss_distance):
-    p = dist_to_ess / ss_distance
-    return weightRising(p) * weightFalling(p)
-
-
 def lead_coeff_function(lc, result, fix, next_fix):
-    """ Lead Coefficient formula from PWC2019"""
-    ''' 11.3.1 Leading coefficient
-        Each started pilot’s track log is used to calculate the leading coefficient (LC), 
-        by calculating the area underneath a graph defined by each track point’s time, 
-        and the distance to ESS at that time. The times used for this calculation are given in seconds 
-        from the moment when the first pilot crossed SSS, to the time when the last pilot reached ESS. 
-        For pilots who land out after the last pilot reached ESS, the calculation keeps going until they land. 
-        The distances used for the LC calculation are given in kilometers and are the distance from each 
-        point’s position to ESS, starting from SSS, but never more than any previously reached distance. 
-        This means that the graph never “goes back”: even if the pilot flies away from goal for a while, 
-        the corresponding points in the graph will use the previously reached best distance towards ESS.
-    '''
-    weight = weight_calc(lc.best_dist_to_ess[1], lc.ss_distance)
-    # time_interval = next_fix.rawtime - fix.rawtime
-    time = next_fix.rawtime - lc.best_start_time
-    progress = lc.best_dist_to_ess[0] - lc.best_dist_to_ess[1]
-    # print(f'weight: {weight}, progress: {progress}, time: {time}')
-    if progress <= 0 or weight == 0:
-        return 0
+    """
+    GAP2020 leading Coefficient Calculation
+    11.3.1 Leading coefficient
+    HG: classic LC calculation
+    PG: weighted area calculation
+    """
+    if lc.comp_class == 'HG':
+        return lclib.classic.lc_calculation(lc, result, fix, next_fix)
     else:
-        return weight * progress * time
-
-
-def missing_area(time_interval, best_distance_to_ESS, ss_distance):
-    p = best_distance_to_ESS / ss_distance
-    return weightFalling(p) * time_interval * best_distance_to_ESS
+        return lclib.weightedarea.lc_calculation(lc, result, fix, next_fix)
 
 
 def tot_lc_calc(res, t):
     """Function to calculate final Leading Coefficient for pilots,
-    that needs to be done when all tracks have been scored"""
-    if res.result_type in ('abs', 'dnf', 'mindist', 'nyp') or not res.SSS_time:
-        '''pilot did't make Start or has no track'''
-        return 0
-    ss_distance = t.SS_distance / 1000
-    if res.ESS_time:
-        '''nothing to do'''
-        landed_out = 0
+    that needs to be done when all tracks have been scored
+    HG: classic LC calculation
+    PG: weighted area calculation
+    """
+    if t.comp_class == 'HG':
+        return lclib.classic.tot_lc_calculation(res, t)
     else:
-        '''pilot did not make ESS'''
-        best_dist_to_ess = (t.opt_dist_to_ESS - res.distance_flown) / 1000  # in Km
-        missing_time = t.max_time - t.start_time  # TODO should be t.min_dept_time but using same as lead_coeff
-        landed_out = missing_area(missing_time, best_dist_to_ess, ss_distance)
-    return (res.fixed_LC + landed_out) / (1800 * ss_distance)
+        return lclib.weightedarea.tot_lc_calculation(res, t)
 
 
 def points_allocation(task):

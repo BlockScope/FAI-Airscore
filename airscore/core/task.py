@@ -26,7 +26,7 @@ from pathlib import Path
 import jsonpickle
 from airspace import AirspaceCheck
 from calcUtils import decimal_to_seconds, get_date, json
-from compUtils import read_rankings
+from ranking import create_rankings
 from db.conn import db_session
 from db.tables import TblTask
 from Defines import MAPOBJDIR, RESULTDIR, TRACKDIR
@@ -236,8 +236,14 @@ class Task(object):
 
     @property
     def ready_to_score(self) -> bool:
-        return bool(self.opt_dist and self.window_open_time and self.window_close_time
-                    and self.start_time and self.start_close_time and self.task_deadline)
+        return bool(
+            self.opt_dist
+            and self.window_open_time
+            and self.window_close_time
+            and self.start_time
+            and self.start_close_time
+            and self.task_deadline
+        )
 
     @property
     def is_set(self) -> bool:
@@ -454,7 +460,8 @@ class Task(object):
 
     @property
     def std_dev_dist(self):
-        from statistics import stdev, StatisticsError
+        from statistics import StatisticsError, stdev
+
         try:
             return stdev([max(p.distance_flown, self.formula.min_dist) for p in self.valid_results])
         except (StatisticsError, IndexError, AttributeError, Exception):
@@ -661,7 +668,7 @@ class Task(object):
             task_id=self.id,
             code='_'.join([self.comp_code, self.task_code]),
             elements=elements,
-            status=status,
+            status=status
         )
         return ref_id, filename
 
@@ -687,11 +694,7 @@ class Task(object):
         for pil in pil_list:
             res = pil.create_result_dict()
             results.append(res)
-        rankings = read_rankings(self.comp_id)
-        # rankings = {}
-        if not rankings or len(rankings) == 0:
-            ''' create an overall ranking'''
-            rankings.update({'overall': [cert for cert in set([p.glider_cert for p in self.pilots])]})
+        rankings = create_rankings(self.comp_id, self.comp_class)
 
         '''create json file'''
         result = {
@@ -700,7 +703,7 @@ class Task(object):
             'results': results,
             'formula': formula,
             'stats': stats,
-            'rankings': rankings,
+            'rankings': rankings
         }
         return result
 
@@ -830,17 +833,8 @@ class Task(object):
 
     def get_pilots(self):
         """ Loads FlightResult obj. with only Participants info into Task obj."""
-        from db.tables import TblParticipant as P
-        from db.tables import TblTaskResult as R
-        from pilot.flightresult import FlightResult
-
-        self.pilots = [FlightResult(**row) for row in P.get_dicts(self.comp_id)]
-        tracks = R.get_all(task_id=self.id)
-        if tracks:
-            for p in self.pilots:
-                res = next((x for x in tracks if x.par_id == p.par_id), None)
-                if res:
-                    p.track_id, p.track_file, p.result_type = res.track_id, res.track_file, res.result_type
+        from pilot.flightresult import get_task_pilots
+        self.pilots = get_task_pilots(task_id=self.id, comp_id=self.comp_id)
 
     def get_results(self, lib=None):
         """ Loads all FlightResult obj. into Task obj."""
@@ -882,7 +876,6 @@ class Task(object):
                 wpt.ssr_lat = sr.lat
                 wpt.ssr_lon = sr.lon
                 wpt.partial_distance = self.partial_distance[idx]
-            # db.commit()
             db.commit()
 
     def delete_task_distance(self):
@@ -982,7 +975,7 @@ class Task(object):
             waytype = "waypoint"
             shape = "circle"
             how = "entry"  # default entry .. looks like xctrack doesn't support exit cylinders apart from SSS
-            wpID = waypoint_list[tp["waypoint"]["name"]]
+            wpID = waypoint_list.get(tp["waypoint"]["name"]) or None
             wpNum = i + 1
 
             if i < len(taskfile_data['turnpoints']) - 1:
@@ -1004,7 +997,7 @@ class Task(object):
 
             turnpoint = Turnpoint(tp['waypoint']['lat'], tp['waypoint']['lon'], tp['radius'], waytype, shape, how)
             turnpoint.name = tp["waypoint"]["name"]
-            # turnpoint.rwp_id = wpID
+            turnpoint.rwp_id = wpID
             turnpoint.num = wpNum
             self.turnpoints.append(turnpoint)
 
@@ -1218,7 +1211,7 @@ class Task(object):
         Unfortunately the fsdb format isn't published so much of this is simply an
         exercise in reverse engineering.
         """
-        from calcUtils import get_int, get_date, get_time, time_to_seconds
+        from calcUtils import get_date, get_int, get_time, time_to_seconds
         from compUtils import get_fsdb_task_path
         from formula import TaskFormula
 
@@ -1797,10 +1790,10 @@ def need_full_rescore(task_id: int):
     with db_session() as db:
         task = db.query(T).filter_by(task_id=task_id).one_or_none()
         if task:
-            formula_last_update = db.query(F.formula_last_update).filter_by(comp_id=task.comp_id).scalar()
-            tracks = db.query(R.track_last_update, R.result_type).filter_by(task_id=task_id).all()
-            min_track_update = min(t.track_last_update for t in tracks if t.result_type not in ['nyp', 'abs', 'dnf'])
-            if min_track_update < max(formula_last_update, task.task_last_update):
+            formula_last_update = db.query(F.last_update).filter_by(comp_id=task.comp_id).scalar()
+            tracks = db.query(R.last_update, R.result_type).filter_by(task_id=task_id).all()
+            min_track_update = min(t.last_update for t in tracks if t.result_type not in ['nyp', 'abs', 'dnf'])
+            if min_track_update < max(formula_last_update, task.last_update):
                 return True
     return False
 
@@ -1815,8 +1808,8 @@ def need_new_scoring(task_id: int):
     with db_session() as db:
         last_file = db.query(F.created).filter_by(task_id=task_id).order_by(F.created.desc()).first()
         if last_file:
-            tracks = db.query(R.track_last_update, R.result_type).filter_by(task_id=task_id).all()
-            max_track_update = max(t.track_last_update for t in tracks)
+            tracks = db.query(R.last_update, R.result_type).filter_by(task_id=task_id).all()
+            max_track_update = max(t.last_update for t in tracks)
             if max_track_update > epoch_to_datetime(last_file.created):
                 return True
     return False

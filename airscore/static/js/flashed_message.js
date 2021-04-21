@@ -1,6 +1,5 @@
 function create_flashed_message(text, category){
   if($('#flashed_messages').length){
-    console.log('running create_flashed_message ...')
     let newdiv = document.createElement( "div" );
     let newdivclass = 'alert-'+category;
     newdiv.classList.add('alert', newdivclass);
@@ -14,4 +13,8 @@ function create_flashed_message(text, category){
     newdiv.appendChild(close);
     $('#flashed_messages').append(newdiv);
   }
+}
+
+function clear_flashed_messages() {
+  $('#flashed_messages').empty();
 }

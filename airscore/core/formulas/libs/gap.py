@@ -20,7 +20,6 @@ from pilot.flightresult import FlightResult
 
 
 def difficulty_calculation(task):
-
     @dataclass
     class Diffslot:
         dist_x10: int
@@ -293,7 +292,7 @@ def pilot_leadout(task, res):
 
     Astart = task.avail_dep_points
 
-    # C.6.3 Leading Points
+    # 11.3.1 Leading coefficient
 
     LCmin = task.min_lead_coeff
     LCp = res.lead_coeff
@@ -301,24 +300,20 @@ def pilot_leadout(task, res):
     # Pilot departure score
     Pdepart = 0
     '''Departure Points type = Leading Points'''
-    if task.departure == 'leadout':  # In PWC is always the case, we can ignore else cases
+    if task.departure == 'leadout':
         if LCp > 0:
             if LCp <= LCmin:
                 Pdepart = Astart
             elif LCmin <= 0:  # this shouldn't happen
                 Pdepart = 0
             else:  # We should have ONLY this case
-                # LeadingFactor = max (0, 1 - ( (LCp -LCmin) / sqrt(LCmin) )^(2/3))
+                # LeadingFactor = max (0, 1 - ( (LCp - LCmin) / sqrt(LCmin) )^(2/3))
                 # LeadingPoints = LeadingFactor * AvailLeadPoints
                 LF = 1 - ((LCp - LCmin) / sqrt(LCmin)) ** (2 / 3)
 
                 if LF > 0:
                     Pdepart = Astart * LF
-    # Sanity
-    if 0 + Pdepart != Pdepart:
-        Pdepart = 0
-    if Pdepart < 0:
-        Pdepart = 0
+
     return Pdepart
 
 
@@ -355,7 +350,6 @@ def pilot_speed(task, res):
         task: Task obj.
         res: FlightResult object
     """
-
     if not res.ESS_time:
         return 0
 
@@ -432,8 +426,8 @@ def pilot_distance(task, pil):
         linear_fraction = 0.5 * pil.distance / task.max_distance
         dist10 = int(pil.distance / 100)  # int(dist in Km * 10)
         diff_fraction = diff[dist10].diff_score
-        if len(diff) > dist10 + 1 and diff[dist10+1].diff_score > diff_fraction:
-            diff_fraction += ((diff[dist10 + 1].diff_score - diff[dist10].diff_score) * (pil.distance / 100 - dist10))
+        if len(diff) > dist10 + 1 and diff[dist10 + 1].diff_score > diff_fraction:
+            diff_fraction += (diff[dist10 + 1].diff_score - diff[dist10].diff_score) * (pil.distance / 100 - dist10)
         return task.avail_dist_points * (linear_fraction + diff_fraction)
 
 
@@ -451,6 +445,7 @@ def calculate_time_points_reduction(t):
     p = FlightResult(ID=0, name='dummy time_points_reduction')
     p.distance_flown = t.opt_dist
     # rules state max start time among all pilot but will be corrected
+    # at the moment (S7F 2021 v0.3) uses p.goal_time, but should be corrected
     p.SSS_time = max(p.SSS_time for p in t.valid_results if p.ESS_time)
     p.ESS_time = t.stop_time
     return pilot_speed(t, p)
@@ -477,7 +472,6 @@ def process_results(task):
 
         '''
         Leadout Points Adjustment
-        C.6.3.1
         '''
         if formula.departure == 'leadout':
             ''' Get Lead Coefficient calculation from Formula library'''
@@ -541,7 +535,11 @@ def points_allocation(task):
         ''' Total score'''
         score = res.distance_score + res.time_score + res.arrival_score + res.departure_score
 
-        ''' Apply Penalty'''
+        ''' 12.4 Penalties
+        If a pilot incurs multiple penalties or bonuses, these are applied in the following order:
+        1. “Jump the Gun”-Penalty
+        2. Percentage penalty or bonus
+        3. Absolute points penalty or bonus'''
         if res.jtg_penalty or res.flat_penalty or res.percentage_penalty:
             """Jump the Gun Penalty:
             totalScore p = max(totalScore p − jumpTheGunPenalty p , scoreForMinDistance)"""

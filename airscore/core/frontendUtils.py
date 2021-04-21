@@ -4,7 +4,6 @@ from functools import partial
 from os import environ, scandir
 from pathlib import Path
 
-import jsonpickle
 import requests
 import ruamel.yaml
 from calcUtils import c_round, sec_to_time
@@ -17,7 +16,7 @@ from db.tables import (
     TblTask,
     TblTaskWaypoint,
 )
-from Defines import IGCPARSINGCONFIG, MAPOBJDIR, track_formats, filename_formats
+from Defines import IGCPARSINGCONFIG, MAPOBJDIR, filename_formats, track_formats
 from flask import current_app, jsonify
 from map import make_map
 from route import Turnpoint
@@ -168,14 +167,13 @@ def get_ladder_results(
     import time
 
     from calcUtils import get_season_dates
-    from compUtils import create_classifications, get_nat
+    from compUtils import get_nat
     from db.tables import TblCompetition as C
     from db.tables import TblLadder as L
     from db.tables import TblLadderComp as LC
     from db.tables import TblLadderSeason as LS
     from db.tables import TblParticipant as P
     from db.tables import TblResultFile as R
-    from db.tables import TblTask as T
     from result import open_json_file
 
     if not (nat and starts and ends):
@@ -393,8 +391,11 @@ def get_admin_comps(current_userid, current_user_access=None):
     return jsonify({'data': all_comps})
 
 
-def get_task_list(comp):
-    tasks = comp.get_tasks_details()
+def get_task_list(comp_id: int) -> dict:
+    """returns a dict of tasks info"""
+    from compUtils import get_tasks_details
+
+    tasks = get_tasks_details(comp_id)
     max_task_num = 0
     last_region = 0
     for task in tasks:
@@ -402,17 +403,8 @@ def get_task_list(comp):
         if int(tasknum) > max_task_num:
             max_task_num = int(tasknum)
             last_region = task['reg_id']
-        task['num'] = f"Task {tasknum}"
-        # check if we have all we need to be able to accept tracks and score:
-        task['ready_to_score'] = (
-            task['opt_dist']
-            and task['window_open_time']
-            and task['window_close_time']
-            and task['start_time']
-            and task['start_close_time']
-            and task['task_deadline']
-        ) is not None
 
+        task['num'] = f"Task {tasknum}"
         task['opt_dist'] = 0 if not task['opt_dist'] else c_round(task['opt_dist'] / 1000, 2)
         task['opt_dist'] = f"{task['opt_dist']} km"
         if task['comment'] is None:
@@ -420,7 +412,59 @@ def get_task_list(comp):
         if not task['track_source']:
             task['track_source'] = ''
         task['date'] = task['date'].strftime('%d/%m/%y')
+
+        task['needs_full_rescore'] = False
+        task['needs_new_scoring'] = False
+        task['needs_recheck'] = False
+        task['ready_to_score'] = False
+
+        if not (task['locked'] or task['cancelled']):
+            '''check if task needs tracks recheck or rescoring'''
+            task['needs_new_scoring'], task['needs_recheck'], task['needs_full_rescore'] = check_task(task['task_id'])
+            '''check if we have all we need to be able to accept tracks and score'''
+            task['ready_to_score'] = (
+                                         task['opt_dist']
+                                         and task['window_open_time']
+                                         and task['window_close_time']
+                                         and task['start_time']
+                                         and task['start_close_time']
+                                         and task['task_deadline']
+                                     ) is not None
+
     return {'next_task': max_task_num + 1, 'last_region': last_region, 'tasks': tasks}
+
+
+def switch_task_lock(task_id: int, old_value: bool) -> bool:
+    """Locks a task (making results official) if it is open, and vice versa"""
+    from db.tables import TblTask
+    from task import get_task_json_filename
+    from result import update_result_status, update_tasks_status_in_comp_result
+    value = not old_value
+    try:
+        '''check task has a valid active result'''
+        result = get_task_json_filename(task_id)
+        if value and not result:
+            '''cannot lock task'''
+            return False
+        task = TblTask.get_by_id(task_id)
+        comp_ud = task.comp_id
+        task.update(locked=value)
+        '''change status'''
+        status = 'Official Result' if value else 'Provisional Results'
+        update_result_status(result, status=status, locked=value)
+        update_tasks_status_in_comp_result(comp_ud)
+        return True
+    except Exception:
+        return False
+
+
+def switch_task_cancelled(task_id: int, old_value: bool, comment: str = None) -> bool:
+    """Declares a task Cancelled (and locked) if it is active, and vice versa"""
+    from db.tables import TblTask
+    value = not old_value
+    task = TblTask.get_by_id(task_id)
+    task.update(cancelled=value, locked=value, comment=comment)
+    return True
 
 
 def get_task_turnpoints(task) -> dict:
@@ -483,8 +527,61 @@ def get_task_turnpoints(task) -> dict:
     else:
         task_map = None
 
-    return {'turnpoints': turnpoints, 'next_number': max_n, 'distance': total_dist,
-            'map': task_map, 'task_set': task.is_set}
+    return {
+        'turnpoints': turnpoints,
+        'next_number': max_n,
+        'distance': total_dist,
+        'map': task_map,
+        'task_set': task.is_set,
+    }
+
+
+def check_task(task_id: int) -> tuple:
+    """check all conditions for task"""
+    from calcUtils import epoch_to_datetime
+    from db.tables import TblResultFile as RF
+    from db.tables import TblTaskResult as R
+    from db.tables import TblForComp as F
+    from db.tables import TblTask as T
+
+    need_full_rescore = False
+    need_new_scoring = False
+    need_older_tracks_recheck = False
+
+    with db_session() as db:
+        '''get last track creation'''
+        query = db.query(R.last_update).filter_by(task_id=task_id).filter(R.track_file.isnot(None))
+        if query.count() > 0:
+            last_track = query.order_by(R.last_update.desc()).first()
+            first_track = query.order_by(R.last_update).first()
+            last_file = db.query(RF).filter_by(task_id=task_id).order_by(RF.created.desc()).first()
+            task = db.query(T).get(task_id)
+            comp_id = task.comp_id
+            formula_updated = db.query(F.last_update).filter_by(comp_id=comp_id).scalar()
+            task_updated = max(formula_updated, task.last_update)
+            last_file_created = None if not last_file else epoch_to_datetime(last_file.created)
+            if last_file_created and last_file_created < max(last_track.last_update, task_updated):
+                '''last results were calculated before last track or last formula changing'''
+                need_new_scoring = True
+            if task_updated > first_track.last_update:
+                '''formula or task has changed after first track was evaluated'''
+                need_older_tracks_recheck = True
+            # todo logic to see if we need a full rescore, probably only if task was canceled and we have more tracks,
+            #  or stopped and elapsed time / multistart with newer tracks started later than previous last
+    return need_new_scoring, need_older_tracks_recheck, need_full_rescore
+
+
+def get_outdated_tracks(task_id: int) -> list:
+    from db.tables import TblTaskResult as R
+    from db.tables import TblForComp as F
+    from db.tables import TblTask as T
+    with db_session() as db:
+        task = db.query(T).get(task_id)
+        comp_id = task.comp_id
+        formula_updated = db.query(F.last_update).filter_by(comp_id=comp_id).scalar()
+        task_updated = max(formula_updated, task.last_update)
+        query = db.query(R.par_id).filter_by(task_id=task_id).filter(R.track_file.isnot(None))
+        return [row.par_id for row in query.filter(R.last_update < task_updated).all()]
 
 
 def get_comp_regions(compid: int):
@@ -532,32 +629,18 @@ def get_waypoint_choices(reg_id: int):
     return choices, wpts
 
 
-def get_pilot_list_for_track_management(taskid: int):
-    from db.tables import TblParticipant as P
-    from db.tables import TblTask as T
-    from db.tables import TblTaskResult as R
+def get_pilot_list_for_track_management(taskid: int, recheck: bool) -> list:
+    from pilot.flightresult import get_task_results
 
-    pilots = [row._asdict() for row in R.get_task_results(taskid)]
-
+    pilots = get_task_results(taskid)
+    outdated = [] if not recheck else get_outdated_tracks(taskid)
     all_data = []
     for pilot in pilots:
-        data = {'ID': pilot['ID'], 'name': pilot['name'], 'par_id': pilot['par_id'], 'track_id': pilot['track_id']}
-        if pilot['track_file']:
-            parid = data['par_id']
-            if pilot['ESS_time']:
-                time = sec_to_time(pilot['ESS_time'] - pilot['SSS_time'])
-                if pilot['result_type'] == 'goal':
-                    result = f'Goal {time}'
-                else:
-                    result = f"ESS {round(pilot['distance_flown'] / 1000, 2)} Km (<del>{time}</del>)"
-            else:
-                result = f"LO {round(pilot['distance_flown'] / 1000, 2)} Km"
-            data['Result'] = f'<a href="/map/{parid}-{taskid}?back_link=0&full=1" target="_blank">{result}</a>'
-        elif pilot['result_type'] == "mindist":
-            data['Result'] = "Min Dist"
-        else:
-            data['Result'] = "Not Yet Processed" if not pilot['track_id'] else pilot['result_type'].upper()
+        data = {e: getattr(pilot, e) for e in ('ID', 'name')}
+        data.update(track_result_output(pilot, task_id=taskid))
+        data['outdated'] = data['par_id'] in outdated
         all_data.append(data)
+
     return all_data
 
 
@@ -632,6 +715,22 @@ def save_turnpoint(task_id: int, turnpoint: Turnpoint):
         return 1
 
 
+def copy_turnpoints_from_task(task_id: int, task_from: int) -> bool:
+    """Copy Task Turnpoints from another one"""
+    from db.tables import TblTaskWaypoint as W
+    objects = []
+    with db_session() as db:
+        origin = db.query(W.num, W.name, W.rwp_id, W.lat, W.lon,
+                          W.altitude, W.description, W.time, W.type, W.how,
+                          W.shape, W.angle, W.radius).filter_by(task_id=task_from).order_by(W.num).all()
+        for row in origin:
+            new = W(task_id=task_id, **row._asdict())
+            objects.append(new)
+
+        db.bulk_save_objects(objects=objects)
+    return True
+
+
 def allowed_tracklog(filename, extension=track_formats):
     ext = Path(filename).suffix
     if not ext:
@@ -651,168 +750,125 @@ def allowed_tracklog_filesize(filesize, size=5):
         return False
 
 
-def process_igc(task_id: int, par_id: int, tracklog):
+def process_igc(task_id: int, par_id: int, tracklog, user, check_g_record=False, check_validity=False):
     from airspace import AirspaceCheck
-    from calcUtils import epoch_to_date
-    from igc_lib import Flight
     from pilot.flightresult import FlightResult, save_track
-    from pilot.track import create_igc_filename, igc_parsing_config_from_yaml
+    from trackUtils import check_flight, igc_parsing_config_from_yaml, import_igc_file, save_igc_file
     from task import Task
+    from tempfile import mkdtemp
+    from Defines import TEMPFILES
+
+    if production():
+        tmpdir = mkdtemp(dir=TEMPFILES)
+        file = Path(tmpdir, tracklog.filename)
+        tracklog.save(file)
+        job = current_app.task_queue.enqueue(process_igc_background,
+                                             task_id, par_id, file, user, check_g_record, check_validity)
+        return True, None
 
     pilot = FlightResult.read(par_id, task_id)
-    if pilot.name:
-        task = Task.read(task_id)
-        fullname = create_igc_filename(task.file_path, task.date, pilot.name, pilot.ID)
-        tracklog.save(fullname)
-        pilot.track_file = Path(fullname).name
-    else:
-        return None, None
+    if not pilot.name:
+        return False, 'Pilot settings are not correct, or not found.'
 
-    """import track"""
-    # track = Track(track_file=fullname, par_id=pilot.par_id)
-    FlightParsingConfig = igc_parsing_config_from_yaml(task.igc_config_file)
-    flight = Flight.create_from_file(fullname, config_class=FlightParsingConfig)
-    """check result"""
-    if not flight:
-        error = f"for {pilot.name} - Track is not a valid track file"
-        return None, error
-    elif not epoch_to_date(flight.date_timestamp) == task.date:
-        error = f"for {pilot.name} - Track has a different date from task date"
-        return None, error
-    else:
-        print(f"pilot {pilot.par_id} associated with track {pilot.track_file} \n")
-
-        """checking track against task"""
-        if task.airspace_check:
-            airspace = AirspaceCheck.from_task(task)
-        else:
-            airspace = None
-        pilot.check_flight(flight, task, airspace_obj=airspace)
-        print(f"track verified with task {task.task_id}\n")
-        '''create map file'''
-        pilot.save_tracklog_map_file(task, flight)
-        """adding track to db"""
-        # pilot.to_db()
-        save_track(pilot, task.id)
-        time = ''
-        data = {'par_id': pilot.par_id, 'track_id': pilot.track_id}
-        if pilot.goal_time:
-            time = sec_to_time(pilot.ss_time)
-        if pilot.result_type == 'goal':
-            data['Result'] = f'Goal {time}'
-        elif pilot.result_type == 'lo':
-            data['Result'] = f"LO {round(pilot.distance / 1000, 2)}"
-        if pilot.track_id:  # if there is a track, make the result a link to the map
-            # trackid = data['track_id']
-            parid = data['par_id']
-            result = data['Result']
-            data['Result'] = f'<a href="/map/{parid}-{task.task_id}?back_link=0" target="_blank">{result}</a>'
-    return data, None
-
-
-def save_igc_background(task_id: int, par_id: int, tracklog, user, check_g_record=False):
-    from pilot.flightresult import FlightResult
-    from pilot.track import create_igc_filename, validate_G_record
-    from task import Task
-
-    pilot = FlightResult.read(par_id, task_id)
-    print = partial(print_to_sse, id=par_id, channel=user)
-    if pilot.name:
-        task = Task.read(task_id)
-        fullname = create_igc_filename(task.file_path, task.date, pilot.name, pilot.ID)
-        tracklog.save(fullname)
-        print('|open_modal')
-        print('***************START*******************')
-        if check_g_record:
-            print('Checking G-Record...')
-            validation = validate_G_record(fullname)
-            if validation == 'FAILED':
-                print('G-Record not valid')
-                data = {'par_id': pilot.par_id, 'track_id': pilot.track_id, 'Result': ''}
-                print(json.dumps(data) + '|g_record_fail')
-                return None, None
-            if validation == 'ERROR':
-                print('Error trying to validate G-Record')
-                return None, None
-            if validation == 'PASSED':
-                print('G-Record is valid')
-        print(f'IGC file saved: {fullname.name}')
-    else:
-        return None, None
-    return fullname
-
-
-def process_igc_background(task_id: int, par_id: int, file: Path, user: str, check_validity=True):
-    import json
-
-    from airspace import AirspaceCheck
-    from calcUtils import epoch_to_date
-    from igc_lib import Flight
-    from pilot.flightresult import FlightResult, save_track
-    from pilot.track import igc_parsing_config_from_yaml
-    from task import Task
-
-    pilot = FlightResult.read(par_id, task_id)
     task = Task.read(task_id)
-    print = partial(print_to_sse, id=par_id, channel=user)
 
     """import track"""
-    # pilot.track = Track(track_file=filename, par_id=pilot.par_id)
     if check_validity:
         FlightParsingConfig = igc_parsing_config_from_yaml(task.igc_config_file)
     else:
         FlightParsingConfig = igc_parsing_config_from_yaml('_overide')
 
-    flight = Flight.create_from_file(file, config_class=FlightParsingConfig)
-    data = {'par_id': pilot.par_id, 'track_id': pilot.track_id, 'Result': 'Not Yet Processed'}
-    """check result"""
-    if not flight:
-        print(f"for {pilot.name} - Track is not a valid track file")
-        print(json.dumps(data) + '|result')
-        return None
-    if not flight.valid:
-        print(f'IGC does not meet quality standard set by igc parsing config. Notes:{flight.notes}')
-        # data['Result'] = 'Not Yet Processed - the IGC was of poor quality. Upload backup file or overide check'
-        data = {'par_id': pilot.par_id, 'track_id': pilot.track_id, 'Result': ''}
-        print(json.dumps(data) + '|valid_fail')
-        return None
-    elif not epoch_to_date(flight.date_timestamp) == task.date:
-        print(f"for {pilot.name} - Track has a different date from task date")
-        print(json.dumps(data) + '|result')
-        return None
-    else:
-        print(f"pilot {pilot.par_id} associated with track {file.name} \n")
-        pilot.track_file = file.name
-        """checking track against task"""
-        if task.airspace_check:
-            airspace = AirspaceCheck.from_task(task)
-        else:
-            airspace = None
-        pilot.check_flight(flight, task, airspace_obj=airspace, print=print)
-        print(f"track verified with task {task.task_id}\n")
-        '''create map file'''
-        pilot.save_tracklog_map_file(task, flight)
-        """adding track to db"""
-        # pilot.to_db()
-        save_track(pilot, task.id)
-        data['track_id'] = pilot.track_id
-        time = ''
+    '''check igc file is correct'''
+    mytrack, error = import_igc_file(tracklog.filename, task, FlightParsingConfig, check_g_record=check_g_record)
+    if error:
+        return False, error['text']
 
-        if pilot.goal_time:
-            time = sec_to_time(pilot.ESS_time - pilot.SSS_time)
+    pilot.track_file = save_igc_file(tracklog, task.file_path, task.date, pilot.name, pilot.ID)
+
+    airspace = None if not task.airspace_check else AirspaceCheck.from_task(task)
+    check_flight(pilot, mytrack, task, airspace, print=print)
+    '''save to database'''
+    save_track(pilot, task.id)
+
+    print(f"track verified with task {task.task_id}\n")
+
+    data = track_result_output(pilot, task_id)
+    return data, None
+
+
+def process_igc_background(task_id: int, par_id: int, file, user, check_g_record=False, check_validity=False):
+    from trackUtils import import_igc_file, save_igc_file, igc_parsing_config_from_yaml, check_flight
+    import json
+    from airspace import AirspaceCheck
+    from pilot.flightresult import FlightResult, save_track
+    from task import Task
+
+    print = partial(print_to_sse, id=par_id, channel=user)
+    print('|open_modal')
+
+    pilot = FlightResult.read(par_id, task_id)
+    if not pilot.name:
+        return False, 'Pilot settings are not correct, or not found.'
+
+    task = Task.read(task_id)
+
+    if check_validity:
+        FlightParsingConfig = igc_parsing_config_from_yaml(task.igc_config_file)
+    else:
+        FlightParsingConfig = igc_parsing_config_from_yaml('_overide')
+
+    data = {'par_id': pilot.par_id, 'track_id': pilot.track_id}
+    '''check igc file is correct'''
+    mytrack, error = import_igc_file(file, task, FlightParsingConfig, check_g_record=check_g_record)
+    if error:
+        '''error importing igc file'''
+        print(f"Error: {error['text']}")
+        data['text'] = error['text']
+        print(f"{json.dumps(data)}|{error['code']}")
+        return None
+
+    pilot.track_file = save_igc_file(file, task.file_path, task.date, pilot.name, pilot.ID)
+    print(f'IGC file saved: {pilot.track_file}')
+    airspace = None if not task.airspace_check else AirspaceCheck.from_task(task)
+    print('***************START*******************')
+    check_flight(pilot, mytrack, task, airspace, print=print)
+    '''save to database'''
+    save_track(pilot, task.id)
+
+    data = track_result_output(pilot, task.task_id)
+
+    print(json.dumps(data) + '|result')
+    print('***************END****************')
+
+    return True
+
+
+def track_result_output(pilot, task_id) -> dict:
+    data = {'par_id': pilot.par_id, 'ID': pilot.ID, 'track_id': pilot.track_id, 'Result': '', 'notifications': ''}
+
+    if not pilot.track_file:
+        data['Result'] = ("Min Dist" if pilot.result_type == "mindist"
+                          else "Not Yet Processed" if pilot.result_type == "nyp"
+                          else pilot.result_type.upper())
+    else:
+        time = ''
+        if pilot.ESS_time:
+            time = sec_to_time(pilot.ss_time)
         if pilot.result_type == 'goal':
-            data['Result'] = f'Goal {time}'
+            data['Result'] = f'GOAL {time}'
+        elif pilot.result_type == 'lo' and time:
+            data['Result'] = f'ESS <del>{time}</del> ({c_round(pilot.distance / 1000, 2)} Km)'
         elif pilot.result_type == 'lo':
-            data['Result'] = f"LO {c_round(pilot.distance / 1000, 2)}"
+            data['Result'] = f"LO {c_round(pilot.distance / 1000, 2)} Km"
         if pilot.track_id:  # if there is a track, make the result a link to the map
-            # trackid = data['track_id']
-            parid = data['par_id']
             result = data['Result']
-            data['Result'] = f'<a href="/map/{parid}-{task.task_id}?back_link=0" target="_blank">{result}</a>'
-        print(data['Result'])
-        print(json.dumps(data) + '|result')
-        print('***************END****************')
-    return None
+            data['Result'] = f'<a href="/map/{pilot.par_id}-{task_id}?back_link=0" target="_blank">{result}</a>'
+        if pilot.notifications:
+            data['notifications'] = f"{'<br />'.join(n.comment for n in pilot.notifications)}"
+            data['Result'] += f'<a class="text-warning p-1 ml-4" data-toggle="tooltip" ' \
+                              f'title="{data["notifications"]}">[Notes]</a>'
+
+    return data
 
 
 def unzip_igc(zipfile):
@@ -917,8 +973,11 @@ def get_task_result_file_list(taskid: int, comp_id: int) -> dict:
     files = []
     with db_session() as db:
         task_results = db.query(R.created, R.filename, R.status, R.active, R.ref_id).filter_by(task_id=taskid).all()
-        comp_results = db.query(R.created, R.filename, R.status, R.active, R.ref_id).filter(R.comp_id == comp_id,
-                                                                                            R.task_id.is_(None)).all()
+        comp_results = (
+            db.query(R.created, R.filename, R.status, R.active, R.ref_id)
+            .filter(R.comp_id == comp_id, R.task_id.is_(None))
+            .all()
+        )
 
         tasks_files = [row._asdict() for row in task_results]
         comp_files = [row._asdict() for row in comp_results]
@@ -1002,6 +1061,46 @@ def get_comp_scorekeeper(compid_or_taskid: int, task_id=False):
     return owner, scorekeepers, all_ids
 
 
+def check_comp_editor(compid: int, user) -> bool:
+    """ check if user is a scorer for the event"""
+    if user.is_admin:
+        return True
+    else:
+        _, _, scorekeeper_ids = get_comp_scorekeeper(compid)
+        return user.id in scorekeeper_ids
+
+
+def change_comp_category(comp_id: int, new: str, formula_name: str) -> bool:
+    from db.tables import TblCompRanking, TblForComp
+    from formula import list_formulas
+    try:
+        with db_session() as db:
+            comp = db.query(TblCompetition).get(comp_id)
+            comp.comp_class = new
+            db.query(TblCompRanking).filter_by(comp_id=comp_id, rank_type='cert').delete(synchronize_session=False)
+            db.flush()
+            formulas = list_formulas().get(new)
+            if formula_name not in formulas:
+                formula_name = formulas[0]
+            formula, preset = get_comp_formula_preset(comp_id, formula_name, new)
+            row = db.query(TblForComp).get(comp_id)
+            row.from_obj(formula)
+            db.flush()
+        return True
+    except:
+        raise
+        return False
+
+
+def get_comp_formula_preset(comp_id: int, formula_name: str, comp_class: str) -> tuple:
+    from formula import Formula
+    formula = Formula.read(comp_id)
+    formula.reset(comp_class, formula_name)
+    lib = formula.get_lib()
+    preset = lib.pg_preset if comp_class == 'PG' else lib.hg_preset
+    return formula, preset
+
+
 def set_comp_scorekeeper(compid: int, userid, owner=False):
     from db.tables import TblCompAuth as CA
 
@@ -1034,11 +1133,57 @@ def get_all_users():
 
     with db_session() as db:
         all_users = db.query(
-            User.id, User.username, User.first_name, User.last_name, User.access, User.email, User.active
+            User.id, User.username, User.first_name, User.last_name, User.access, User.email, User.active, User.nat
         ).all()
         if all_users:
             all_users = [row._asdict() for row in all_users]
         return all_users
+
+
+def generate_random_password() -> str:
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits
+    password = ''.join(secrets.choice(alphabet) for i in range(20))  # for a 20-character password
+    return password
+
+
+def generate_serializer():
+    from itsdangerous import URLSafeTimedSerializer
+    from airscore.settings import SECRET_KEY
+    return URLSafeTimedSerializer(SECRET_KEY)
+
+
+def generate_confirmation_token(email):
+    from airscore.settings import SECURITY_PASSWORD_SALT
+    serializer = generate_serializer()
+    return serializer.dumps(email, salt=SECURITY_PASSWORD_SALT)
+
+
+def confirm_token(token, expiration=86400):
+    from airscore.settings import SECURITY_PASSWORD_SALT
+    serializer = generate_serializer()
+    try:
+        email = serializer.loads(
+            token,
+            salt=SECURITY_PASSWORD_SALT,
+            max_age=expiration
+        )
+    except:
+        return False
+    return email
+
+
+def send_email(recipients, subject, text_body, html_body, sender=None):
+    from airscore.extensions import mail
+    from airscore.settings import ADMINS
+    mail.send_message(
+        recipients=recipients,
+        subject=subject,
+        body=text_body,
+        html=html_body,
+        sender=sender or ADMINS
+    )
 
 
 def update_airspace_file(old_filename, new_filename):
@@ -1114,7 +1259,7 @@ def get_comp_info(compid: int, task_ids=None):
 
     with db_session() as db:
         non_scored_tasks = (
-            db.query(t.task_id.label('id'), t.task_name, t.date, t.task_type, t.opt_dist, t.comment)
+            db.query(t.task_id.label('id'), t.task_name, t.date, t.task_type, t.opt_dist, t.comment, t.cancelled)
             .filter(t.comp_id == compid, t.task_id.notin_(task_ids))
             .order_by(t.date.desc())
             .all()
@@ -1125,9 +1270,9 @@ def get_comp_info(compid: int, task_ids=None):
             .filter(c.comp_id == compid)
             .one()
         )
-    comp = competition_info._asdict()
+        comp = competition_info._asdict()
 
-    return comp, non_scored_tasks
+        return comp, [row._asdict() for row in non_scored_tasks]
 
 
 def get_participants(compid: int, source='all'):
@@ -1242,13 +1387,16 @@ def unique_filename(filename, filepath):
     return secure_filename(filename)
 
 
-def get_pretty_data(content: dict) -> dict or str:
+def get_pretty_data(content: dict, export=False) -> dict or str:
     """transforms result json file in human readable data"""
     from result import get_startgates, pretty_format_results
+    from calcUtils import get_date
 
     try:
         '''time offset'''
         timeoffset = 0 if 'time_offset' not in content['info'].keys() else int(content['info']['time_offset'])
+        '''result file type'''
+        result_type = content['file_stats']['result_type']
         '''score decimals'''
         td = (
             0
@@ -1257,17 +1405,17 @@ def get_pretty_data(content: dict) -> dict or str:
         )
         cd = (
             0
-            if 'formula' not in content.keys() or 'task_result_decimal' not in content['formula'].keys()
-            else int(content['formula']['task_result_decimal'])
+            if 'formula' not in content.keys() or 'comp_result_decimal' not in content['formula'].keys()
+            else int(content['formula']['comp_result_decimal'])
         )
         pretty_content = dict()
         if 'file_stats' in content.keys():
             pretty_content['file_stats'] = pretty_format_results(content['file_stats'], timeoffset)
         pretty_content['info'] = pretty_format_results(content['info'], timeoffset)
         if 'comps' in content.keys():
-            pretty_content['comps'] = pretty_format_results(content['comps'], timeoffset, td)
+            pretty_content['comps'] = pretty_format_results(content['comps'], timeoffset)
         if 'tasks' in content.keys():
-            pretty_content['tasks'] = pretty_format_results(content['tasks'], timeoffset, td)
+            pretty_content['tasks'] = pretty_format_results(content['tasks'], timeoffset)
         elif 'route' in content.keys():
             pretty_content['info'].update(startgates=get_startgates(content['info']))
             pretty_content['route'] = pretty_format_results(content['route'], timeoffset)
@@ -1278,43 +1426,86 @@ def get_pretty_data(content: dict) -> dict or str:
         if 'results' in content.keys():
             results = []
             '''rankings'''
-            sub_classes = sorted(
-                [
-                    dict(name=c, cert=v, limit=v[-1], prev=None, rank=1, counter=0)
-                    for c, v in content['rankings'].items()
-                    if isinstance(v, list)
-                ],
-                key=lambda x: len(x['cert']),
-                reverse=True,
-            )
-            if content['rankings']['female']:
-                sub_classes.append(dict(name='Female', cert='female', limit='female', prev=None, rank=1, counter=0))
+            rankings = [dict(rank=1, counter=0, prev=None, **rank) for rank in content['rankings']]
+
             rank = 0
             prev = None
             for idx, r in enumerate(content['results'], 1):
-                p = pretty_format_results(r, timeoffset, td, cd)
-                if not prev == p['score']:
-                    rank, prev = idx, p['score']
-                p['rank'] = str(rank)
-                '''sub-classes'''
-                for s in sub_classes:
-                    if (
-                        (p['glider_cert'] and p['glider_cert'] in s['cert'])
-                        if not s['name'] == 'Female'
-                        else p['sex'] == 'F'
-                    ):
-                        s['counter'] += 1
-                        if not s['prev'] == p['score']:
-                            s['rank'], s['prev'] = s['counter'], p['score']
-                        p[s['limit']] = f"{s['rank']} ({p['rank']})"
-                    else:
-                        p[s['limit']] = ''
-                results.append(p)
+                # p = pretty_format_results(r, timeoffset, td, cd)
+                '''rankings'''
+                if result_type == 'comp' or r['result_type']:
+                    d = cd if result_type == 'comp' else td
+                    r['score'] = c_round(r['score'] or 0, d)
+                    if not prev == r['score']:
+                        rank, prev = idx, r['score']
+                    r['rank'] = rank
+                    r['rankings'] = {}
+                    for s in rankings:
+                        if s['rank_type'] == 'overall':
+                            r['rankings'][s['rank_id']] = rank
+                            s['counter'] += 1
+                        elif (
+                                (s['rank_type'] == 'cert' and r['glider_cert'] in s['certs'])
+                                or (s['rank_type'] == 'female' and r['sex'] == 'F')
+                                or (s['rank_type'] == 'nat' and r['nat'] == s['nat'])
+                                or (s['rank_type'] == 'custom' and 'custom' in r.keys()
+                                    and r['custom'][str(s['attr_id'])] == s['rank_value'])
+                                or (s['rank_type'] == 'birthdate' and 'birthdate' in r.keys()
+                                    and isinstance(get_date(r['birthdate']), datetime.date)
+                                    and (
+                                            (s['min_date'] and get_date(s['min_date']) <= get_date(r['birthdate']))
+                                            or (s['max_date'] and get_date(s['max_date']) >= get_date(r['birthdate']))
+                                    ))
+                        ):
+                            s['counter'] += 1
+                            if not s['prev'] == r['score']:
+                                s['rank'], s['prev'] = s['counter'], r['score']
+                            r['rankings'][s['rank_id']] = f"{s['rank']} ({r['rank']})"
+                        else:
+                            r['rankings'][s['rank_id']] = ''
+                    if result_type == 'comp':
+                        r['name'] = f"<span class='sex-{r['sex']}'><b>{r['name']}</b></span>"
+                        '''task results format'''
+                        for k, v in r['results'].items():
+                            if v['score'] == v['pre']:
+                                v['score'] = f"{v['score']:.{td}f}"
+                            else:
+                                v['score'] = f"{v['score']:.{td}f} <del>{v['pre']:.{td}f}</del>"
+                        r['score'] = f"<strong>{r['score']:.{cd}f}</strong>"
+                        r = pretty_format_results(r, timeoffset)
+                    elif result_type == 'task':
+                        task_id = content['info']['id']
+                        stopped = content['info']['stopped_time']
+                        goal_alt = content['info']['goal_altitude']
+                        if export or not r['track_file']:
+                            r['name'] = f"<span class='sex-{r['sex']}'><b>{r['name']}</b></span>"
+                        else:
+                            r['name'] = f"<a class='sex-{r['sex']}' href='/map/{r['par_id']}-{task_id}'>" \
+                                        f"<b>{r['name']}</b></a>"
+                        if r['penalty']:
+                            p = r['penalty']
+                            style = f"{'danger' if p > 0 else 'success'}"
+                            r['penalty'] = f"<strong class='text-{style}'>{p:.{td}f}</strong>"
+                            r['score'] = f"<strong class='text-{style}'>{r['score']:.{td}f}</strong>"
+                        else:
+                            r['score'] = f"<strong>{r['score']:.{td}f}</strong>"
+                        r = pretty_format_results(r, timeoffset)
+                        goal = r['goal_time']
+                        r['ESS_time'] = r['ESS_time'] if goal else f"<del>{r['ESS_time']}</del>"
+                        r['speed'] = r['speed'] if goal else f"<del>{r['speed']}</del>"
+                        r['ss_time'] = r['ss_time'] if goal else f"<del>{r['ss_time']}</del>"
+                        if stopped and r['stopped_altitude']:
+                            r['stopped_altitude'] = f"+{max(0, r['stopped_altitude'] - goal_alt)}"
+                        # ab = ''  # alt bonus
+                results.append(r)
             pretty_content['results'] = results
-            pretty_content['classes'] = [{k: c[k] for k in ('name', 'limit', 'cert', 'counter')} for c in sub_classes]
+            pretty_content['rankings'] = [
+                {k: c[k] for k in ('rank_id', 'rank_name', 'description', 'counter')} for c in rankings
+            ]
+
         return pretty_content
     except Exception:
-        # raise
+        raise
         return 'error'
 
 
@@ -1377,22 +1568,49 @@ def check_short_code(comp_short_code):
             return True
 
 
-def import_participants_from_fsdb(file: Path, from_CIVL=False) -> list:
+def import_participants_from_fsdb(comp_id: int, file: Path, from_CIVL=False) -> dict:
     """read the fsdb file"""
-    from fsdb import read_fsdb_file
-    from pilot.participant import Participant
+    from fsdb import FSDB
+    from pilot.participant import unregister_all
+    from ranking import delete_meta
 
-    root = read_fsdb_file(file)
-    pilots = []
+    try:
+        fsdb = FSDB.read(file, from_CIVL=from_CIVL)
+        if len(fsdb.comp.participants) == 0:
+            return dict(success=False, error='Error: not a valid FSDB file or has no participants.')
 
-    print("Getting Pilots Info...")
-    if from_CIVL:
-        print('*** get from CIVL database')
-    p = root.find('FsCompetition').find('FsParticipants')
-    for pil in p.iter('FsParticipant'):
-        pilot = Participant.from_fsdb(pil, from_CIVL=from_CIVL)
-        pilots.append(pilot)
-    return pilots
+        if fsdb.custom_attributes:
+            delete_meta(comp_id=comp_id)
+            fsdb.add_custom_attributes(comp_id=comp_id)
+        unregister_all(comp_id=comp_id)
+        if fsdb.add_participants(comp_id=comp_id):
+            return dict(success=True)
+        return dict(success=False, error='Error: Participants were not imported correctly.')
+    except (FileNotFoundError, TypeError, Exception):
+        return dict(success=False, error='Internal error trying to parse FSDB file.')
+
+
+def import_participants_from_excel_file(comp_id: int, excel_file: Path) -> dict:
+    from pilot.participant import unregister_all, extract_participants_from_excel, mass_import_participants
+    from ranking import delete_meta
+
+    pilots, custom_attributes = extract_participants_from_excel(comp_id, excel_file)
+    if not pilots:
+        return jsonify(success=False, error='Error: not a valid excel file or has no participants.')
+    if custom_attributes:
+        delete_meta(comp_id)
+        for attr in custom_attributes:
+            attr.to_db()
+        for pil in pilots:
+            '''creates Participant.custom'''
+            for attr in pil.attributes:
+                attr_id = next((el.attr_id for el in custom_attributes if el.attr_value == attr['attr_value']), None)
+                pil.custom[attr_id] = attr['meta_value']
+            pil.attributes = None
+    unregister_all(comp_id)
+    if mass_import_participants(comp_id, pilots, check_ids=False):
+        return dict(success=True)
+    return dict(success=False, error='Error: Participants were not imported correctly.')
 
 
 def create_participants_html(comp_id: int) -> (str, dict) or None:
@@ -1483,34 +1701,6 @@ def create_stream_content(content):
         return None
 
 
-def list_classifications() -> dict:
-    """Lists all classifications stored in database.
-    :returns a dictionary with 3 lists.
-        all: a list of all classifications
-        pg: a list of all classifications that are of class pg or mixed
-        hg: a list of all classifications that are of class hg or mixed"""
-    from db.tables import TblClassification as C
-
-    all_classifications = []
-    hg_classifications = []
-    pg_classifications = []
-
-    results = C.get_all()
-    if results:
-        for el in results:
-            all_classifications.append(el.as_dict())
-            if el.comp_class in ('PG', 'mixed'):
-                pg_classifications.append(el.as_dict())
-            if el.comp_class in ('HG', 'mixed'):
-                hg_classifications.append(el.as_dict())
-
-    return {
-        'ALL': sorted(all_classifications, key=lambda x: x['cat_name']),
-        'PG': sorted(pg_classifications, key=lambda x: x['cat_name']),
-        'HG': sorted(hg_classifications, key=lambda x: x['cat_name']),
-    }
-
-
 def list_countries() -> list:
     """Lists all countries with IOC code stored in database.
     :returns a list of dicts {name, code}"""
@@ -1518,56 +1708,6 @@ def list_countries() -> list:
 
     clist = TblCountryCode.get_list()
     return clist or []
-
-
-def get_classifications_details(comp_class: str = None) -> list:
-    from db.tables import TblCertification as CCT
-    from db.tables import TblClasCertRank as CC
-    from db.tables import TblClassification as CT
-    from db.tables import TblRanking as R
-
-    output = []
-    with db_session() as db:
-        query = (
-            db.query(
-                CT.cat_id,
-                CT.cat_name,
-                CT.comp_class,
-                CT.female,
-                CT.team,
-                R.rank_name.label('rank'),
-                CCT.cert_name.label('cert'),
-            )
-            .select_from(R)
-            .join(CC, R.rank_id == CC.c.rank_id)
-            .join(CCT, (CCT.cert_id <= CC.c.cert_id) & (CCT.comp_class == R.comp_class))
-            .join(CT, CT.cat_id == CC.c.cat_id)
-            .filter(CC.c.cert_id > 0)
-        )
-        if comp_class:
-            query = query.filter(CT.comp_class == comp_class)
-        results = query.all()
-
-    if results:
-        classifications = set(x.cat_id for x in results)
-        for cl in classifications:
-            elements = [x for x in results if x.cat_id == cl]
-            classification = dict(
-                cat_id=cl,
-                cat_name=elements[0].cat_name,
-                comp_class=elements[0].comp_class,
-                female=elements[0].female,
-                team=elements[0].team,
-            )
-            classification['categories'] = []
-            for res in elements:
-                el = next((x for x in classification['categories'] if x['title'] == res.rank), None)
-                if el:
-                    el['members'].append(res.cert)
-                else:
-                    classification['categories'].append(dict(title=res.rank, members=[res.cert]))
-            output.append(classification)
-    return output
 
 
 def list_track_sources() -> list:
@@ -1639,8 +1779,6 @@ def save_comp_ladders(comp_id: int, ladder_ids: list or None) -> bool:
         LC.delete_all(comp_id=comp_id)
         if ladder_ids:
             '''save entries'''
-            # if isinstance(ladder_ids, int):
-            #     ladder_ids = [ladder_ids]
             results = []
             for el in ladder_ids:
                 results.append(LC(comp_id=comp_id, ladder_id=el))
@@ -1649,6 +1787,50 @@ def save_comp_ladders(comp_id: int, ladder_ids: list or None) -> bool:
     except Exception:
         # raise
         return False
+
+
+def get_comp_result_files(comp_id: int, offset: int = None) -> dict:
+    import time
+    from Defines import RESULTDIR
+    from db.tables import TblResultFile as R, TblCompetition as C
+    from result import open_json_file
+
+    with db_session() as db:
+        query = (
+            db.query(R.created, R.filename, R.status, R.active, R.ref_id)
+            .filter(R.comp_id == comp_id, R.task_id.is_(None))
+            .all()
+        )
+        comp_results = [row._asdict() for row in query]
+        if not offset:
+            offset = db.query(C).get(comp_id).time_offset
+
+    comp_header, comp_active = get_score_header(comp_results, offset)
+    comp_choices = []
+
+    for file in comp_results:
+        published = time.ctime(file['created'] + offset)
+        if not Path(RESULTDIR, file['filename']).is_file():
+            status = f"FILE NOT FOUND"
+            tasks = []
+        else:
+            status = '' if file['status'] in [None, 'None'] else file['status']
+            if 'Overview' in file['filename']:
+                status = 'Auto Generated ' + status
+            data = open_json_file(Path(RESULTDIR, file['filename']))
+            tasks = data.get('tasks')
+        comp_choices.append(dict(filename=file['filename'],
+                                 text=f'{published} - {status}' if status else f'{published}',
+                                 status=status,
+                                 timestamp=published,
+                                 tasks=tasks))
+    comp_choices.reverse()
+
+    return {
+        'comp_choices': comp_choices,
+        'comp_header': comp_header,
+        'comp_active': comp_active,
+    }
 
 
 def get_task_result_files(task_id: int, comp_id: int = None, offset: int = None) -> dict:
@@ -1686,12 +1868,13 @@ def get_task_result_files(task_id: int, comp_id: int = None, offset: int = None)
         comp_choices.append((file['filename'], f'{published} - {status}' if status else f'{published}'))
     comp_choices.reverse()
 
-    return {'task_choices': task_choices,
-            'task_header': task_header,
-            'task_active': task_active,
-            'comp_choices': comp_choices,
-            'comp_header': comp_header,
-            'comp_active': comp_active
+    return {
+        'task_choices': task_choices,
+        'task_header': task_header,
+        'task_active': task_active,
+        'comp_choices': comp_choices,
+        'comp_header': comp_header,
+        'comp_active': comp_active,
     }
 
 
@@ -1750,6 +1933,20 @@ def publish_comp_result(comp_id: int, filename: str) -> bool:
         return False
 
 
+def publish_all_results(comp_id: int):
+    """used for imported event autopublish:
+    sets active all results of a given comp, assuming there is only one per task and final"""
+    from db.tables import TblResultFile as R
+    from db.conn import db_session
+    from comp import Comp
+    with db_session() as db:
+        results = db.query(R).filter_by(comp_id=comp_id)
+        for row in results:
+            row.active = 1
+    '''update comp result'''
+    Comp.create_results(comp_id, status='Created from FSDB imported results', name_suffix='Overview')
+
+
 def update_comp_result(comp_id: int, status: str = None, name_suffix: str = None) -> tuple:
     """Unpublish any active result, and creates a new one"""
     from comp import Comp
@@ -1765,16 +1962,20 @@ def update_comp_result(comp_id: int, status: str = None, name_suffix: str = None
 def task_has_valid_results(task_id: int) -> bool:
 
     from db.tables import TblTaskResult as TR
+
     return bool(TR.get_task_flights(task_id))
 
 
 def get_task_info(task_id: int) -> dict:
 
     from task import Task
+    import time
+
     result = {}
     task = Task.read(task_id)
     if task:
         result = task.create_json_elements()
+        result['file_stats'] = {'result_type': 'task', "timestamp": int(time.time()), "status": "tracks status"}
     return result
 
 
@@ -1792,9 +1993,9 @@ def convert_external_comp(comp_id: int) -> bool:
             tasks = [el for el, in db.query(T.task_id).filter_by(comp_id=comp_id).distinct()]
             if tasks:
                 '''clear tasks results'''
-                results = db.query(R)\
-                    .filter(R.task_id.in_(tasks))\
-                    .filter(R.result_type.notin_(['abs', 'dnf', 'mindist']))
+                results = (
+                    db.query(R).filter(R.task_id.in_(tasks)).filter(R.result_type.notin_(['abs', 'dnf', 'mindist']))
+                )
                 if results:
                     tracks = [el.track_id for el in results.all()]
                     db.query(TW).filter(TW.track_id.in_(tracks)).delete(synchronize_session=False)
@@ -1819,10 +2020,11 @@ def convert_external_comp(comp_id: int) -> bool:
 
 
 def check_openair_file(file) -> tuple:
+    from shutil import copyfile
+    from tempfile import TemporaryDirectory
+
     from airspaceUtils import openair_content_to_data, save_airspace_map_check_files
     from Defines import AIRSPACEDIR
-    from tempfile import TemporaryDirectory
-    from shutil import copyfile
 
     modified = False
     with TemporaryDirectory() as tempdir:
@@ -1872,7 +2074,266 @@ def get_igc_filename_formats_list() -> list:
 
 
 def check_participants_ids(comp_id: int, pilots: list) -> list:
-    """ gets a list of pilots and checks their ID validity against registered pilots and correct formats
-        returns a list of pilots with correct IDs"""
+    """gets a list of pilots and checks their ID validity against registered pilots and correct formats
+    returns a list of pilots with correct IDs"""
     from pilot.participant import get_valid_ids
+
     return get_valid_ids(comp_id, pilots)
+
+
+def check_zip_file(file: Path, extensions: list = None) -> tuple:
+    """function to check if zip file is a valid archive and is not empty"""
+    from zipfile import ZipFile, is_zipfile
+
+    if not is_zipfile(file):
+        return False, 'File is not a valid archive.'
+    zipfile = ZipFile(file)
+    if zipfile.testzip():
+        return False, 'Zip file is corrupt.'
+    elements = zipfile.namelist()
+    if not elements or extensions and not any(el for el in elements if Path(el).suffix[1:] in extensions):
+        return False, f'Zip file is empty or does not contain any file with extension: {", ".join(extensions)}.'
+    return True, 'success'
+
+
+def get_comp_rankings(comp_id: int) -> list:
+    from ranking import CompRanking
+    rankings = []
+    rows = CompRanking.read_all(comp_id)
+    for el in rows:
+        rankings.append(dict(description=el.description, **el.as_dict()))
+    return rankings
+
+
+def get_certifications_details() -> dict:
+    from db.tables import TblCertification as CCT
+    certifications = {}
+    with db_session() as db:
+        certs = db.query(CCT).order_by(CCT.comp_class, CCT.cert_order.desc())
+        for cl in ('PG', 'HG'):
+            certifications[cl] = [{'cert_id': el.cert_id, 'cert_name': el.cert_name}
+                                  for el in certs if el.comp_class == cl]
+    return certifications
+
+
+def get_comp_meta(comp_id: int) -> list:
+    from db.tables import TblCompAttribute as CA, TblCompRanking as CR
+    with db_session() as db:
+        results = db.query(CA).filter_by(comp_id=comp_id)
+        ranks = [el.attr_id for el in db.query(CR).filter_by(comp_id=comp_id).distinct() if el.attr_id]
+        return [{'attr_id': el.attr_id,
+                 'attr_key': el.attr_key,
+                 'attr_value': el.attr_value,
+                 'used': True if el.attr_id in ranks else False} for el in results]
+
+
+def delete_comp_attribute(attr_id: int) -> bool:
+    from db.tables import TblCompAttribute as CA
+    with db_session() as db:
+        try:
+            db.query(CA).get(attr_id).delete()
+            return True
+        except Exception:
+            # raise
+            return False
+
+
+def save_airspace_check(comp_id: int, task_id: int, obj: dict) -> bool:
+    """At the moment Airspace check is considering each event has just one parameters setup, but arguments are
+    ready to create task settings. I don't think there is this need at the moment.
+    task_id is always None"""
+    from db.tables import TblAirspaceCheck as A
+    try:
+        row = A.get_one(comp_id=comp_id, task_id=task_id)
+        row.update(**obj)
+        return True
+    except Exception:
+        # raise
+        return False
+
+
+def start_livetracking(task_id: int):
+    if production():
+        job_id = f'job_livetracking_task_{task_id}'
+        job = current_app.task_queue.enqueue(run_livetracking_background,
+                                             task_id,
+                                             job_id=job_id,
+                                             job_timeout=36000)
+        return job.get_id()
+
+
+def run_livetracking_background(task_id: int):
+    from livetracking import LiveTracking
+    lt = LiveTracking.read(task_id)
+    lt.run()
+
+
+def create_new_comp(comp, user_id: int) -> dict:
+    from compUtils import create_comp_path
+    from formula import Formula, list_formulas
+    from ranking import create_overall_ranking
+    from airspace import create_check_parameters
+
+    comp.comp_path = create_comp_path(comp.date_from, comp.comp_code)
+    output = comp.to_db()
+    if isinstance(output, int):
+        formulas = list_formulas().get(comp.comp_class)
+        formula = Formula.from_preset(comp.comp_class, formulas[-1])
+        formula.comp_id = comp.comp_id
+        formula.to_db()
+        set_comp_scorekeeper(comp.comp_id, user_id, owner=True)
+        create_overall_ranking(comp.comp_id)
+        create_check_parameters(comp.comp_id)
+        return {'success': True}
+    return {'success': False, 'errors': {'Error': ['There was an error trying to save new Competition']}}
+
+
+def recheck_track(task_id: int, par_id: int, user) -> tuple:
+    from airspace import AirspaceCheck
+    from pilot.flightresult import FlightResult, save_track
+    from trackUtils import check_flight, igc_parsing_config_from_yaml, import_igc_file
+    from task import Task
+
+    if production():
+        job = current_app.task_queue.enqueue(recheck_track_background,
+                                             task_id, par_id, user)
+        return True, None
+
+    pilot = FlightResult.read(par_id=par_id, task_id=task_id)
+    task = Task.read(task_id)
+
+    """import track"""
+    file = Path(task.file_path, pilot.track_file)
+    FlightParsingConfig = igc_parsing_config_from_yaml('_overide')
+    flight, error = import_igc_file(file, task, FlightParsingConfig)
+    if error:
+        return False, error['text']
+
+    '''recheck track'''
+    airspace = None if not task.airspace_check else AirspaceCheck.from_task(task)
+    check_flight(pilot, flight, task, airspace, print=print)
+    '''save to database'''
+    save_track(pilot, task.id)
+
+    print(f"track verified with task {task.task_id}\n")
+
+    data = track_result_output(pilot, task_id)
+    return data, None
+
+
+def recheck_track_background(task_id: int, par_id: int, user):
+    from trackUtils import import_igc_file, igc_parsing_config_from_yaml, check_flight
+    import json
+    from airspace import AirspaceCheck
+    from pilot.flightresult import FlightResult, save_track
+    from task import Task
+
+    print = partial(print_to_sse, id=par_id, channel=user)
+    print('|open_modal')
+
+    pilot = FlightResult.read(par_id, task_id)
+    task = Task.read(task_id)
+    data = {'par_id': pilot.par_id, 'track_id': pilot.track_id}
+
+    """import track"""
+    file = Path(task.file_path, pilot.track_file)
+    FlightParsingConfig = igc_parsing_config_from_yaml('_overide')
+    flight, error = import_igc_file(file, task, FlightParsingConfig)
+    if error:
+        '''error importing igc file'''
+        print(f"Error: {error['text']}")
+        print(f"{json.dumps(data)}|{error['code']}")
+        return None
+
+    '''recheck track'''
+    airspace = None if not task.airspace_check else AirspaceCheck.from_task(task)
+    print('***************START*******************')
+    check_flight(pilot, flight, task, airspace, print=print)
+    '''save to database'''
+    save_track(pilot, task.id)
+
+    data = track_result_output(pilot, task.task_id)
+    data['outdated'] = False
+
+    print(json.dumps(data) + '|result')
+    print('***************END****************')
+
+    return True
+
+
+def recheck_tracks(task_id: int, username: str):
+    """get list of tracks that need to be evaluated, and process them"""
+    from pilot.flightresult import FlightResult, update_all_results
+    from task import Task
+    from airspace import AirspaceCheck
+    from trackUtils import igc_parsing_config_from_yaml, check_flight
+    from igc_lib import Flight
+
+    if production():
+        job = current_app.task_queue.enqueue(recheck_tracks_background,
+                                             task_id=task_id,
+                                             user=username,
+                                             job_timeout=2000)
+        return True
+
+    par_ids = get_outdated_tracks(task_id)
+    pilots_to_save = []
+    task = Task.read(task_id)
+    track_path = task.file_path
+    FlightParsingConfig = igc_parsing_config_from_yaml(task.igc_config_file)
+    airspace = None if not task.airspace_check else AirspaceCheck.from_task(task)
+
+    for par in par_ids:
+        pilot = FlightResult.read(par_id=par, task_id=task_id)
+        file = Path(track_path, pilot.track_file)
+        flight = Flight.create_from_file(file, config_class=FlightParsingConfig)
+        check_flight(pilot, flight, task, airspace=airspace)
+        pilots_to_save.append(pilot)
+    '''save all succesfully processed pilots to database'''
+    update_all_results([p for p in pilots_to_save], task_id)
+    return True
+
+
+def recheck_tracks_background(task_id: int, user: str):
+    from task import Task
+    from airspace import AirspaceCheck
+    from trackUtils import igc_parsing_config_from_yaml, check_flight
+    from pilot.flightresult import update_all_results
+    from igc_lib import Flight
+
+    pilots_to_save = []
+    print = partial(print_to_sse, id=None, channel=user)
+    print('|open_modal')
+    task = Task.read(task_id)
+    track_path = task.file_path
+    task.get_pilots()
+    par_ids = get_outdated_tracks(task_id)
+    outdated_results = filter(lambda x: x.par_id in par_ids, task.results)
+    FlightParsingConfig = igc_parsing_config_from_yaml(task.igc_config_file)
+    airspace = None if not task.airspace_check else AirspaceCheck.from_task(task)
+    for pilot in outdated_results:
+        # pilot = FlightResult.read(par_id=par, task_id=task_id)
+        file = Path(track_path, pilot.track_file)
+        flight = Flight.create_from_file(file, config_class=FlightParsingConfig)
+        print(f"processing {pilot.ID} {pilot.name}:")
+        pilot_print = partial(print_to_sse, id=pilot.par_id, channel=user)
+        print('***************START*******************')
+        check_flight(pilot, flight, task, airspace, print=pilot_print)
+        if pilot.notifications:
+            print(f"NOTES:<br /> {'<br />'.join(n.comment for n in pilot.notifications)}")
+
+        pilots_to_save.append(pilot)
+        data = track_result_output(pilot, task.task_id)
+        pilot_print(f'{json.dumps(data)}|result')
+        print('***************END****************')
+    print("*****************re-processed all tracks********************")
+
+    '''save all succesfully processed pilots to database'''
+    update_all_results([p for p in pilots_to_save], task_id)
+    print('|page_reload')
+
+
+def recheck_needed(task_id: int):
+    from task import task_need_recheck
+    return task_need_recheck(task_id)
+

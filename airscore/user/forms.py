@@ -13,6 +13,23 @@ import Defines
 from .models import User
 
 
+percentage_choices = [(0.1, '10%'), (0.2, '20%'), (0.3, '30%'), (0.4, '40%'), (0.5, '50%'),
+                      (0.6, '60%'), (0.7, '70%'), (0.8, '80%'), (0.9, '90%'), (1.0, '100%')]
+
+time_zones = [(-43200, '-12:00'), (-41400, '-11:30'), (-39600, '-11:00'), (-37800, '-10:30'), (-36000, '-10:00'),
+              (-34200, '-9:30'), (-32400, '-9:00'), (-30600, '-8:30'), (-28800, '-8:00'), (-27000, '-7:30'),
+              (-25200, '-7:00'), (-23400, '-6:30'), (-21600, '-6:00'), (-19800, '-5:30'), (-18000, '-5:00'),
+              (-16200, '-4:30'), (-14400, '-4:00'), (-12600, '-3:30'), (-10800, '-3:00'), (-9000, '-2:30'),
+              (-7200, '-2:00'), (-5400, '-1:30'), (-3600, '-1:00'), (-1800, '-0:30'), (0, '+0:00'),
+              (1800, '+0:30'), (3600, '+1:00'), (5400, '+1:30'), (7200, '+2:00'), (9000, '+2:30'),
+              (10800, '+3:00'), (12600, '+3:30'), (14400, '+4:00'), (16200, '+4:30'), (18000, '+5:00'),
+              (19800, '+5:30'), (20700, '+5:45'), (21600, '+6:00'), (23400, '+6:30'), (25200, '+7:00'),
+              (27000, '+7:30'), (28800, '+8:00'), (30600, '+8:30'), (31500, '+8:45'), (32400, '+9:00'),
+              (34200, '+9:30'), (36000, '+10:00'), (37800, '+10:30'), (39600, '+11:00'), (41400, '+11:30'),
+              (43200, '+12:00'), (45000, '+12:30'), (45900, '+12:45'), (46800, '+13:00'), (48600, '+13:30'),
+              (50400, '+14:00')]
+
+
 class RegisterForm(FlaskForm):
     """Register form."""
 
@@ -35,6 +52,7 @@ class RegisterForm(FlaskForm):
     last_name = StringField(
         "Last name", validators=[DataRequired(), Length(min=2, max=25)]
     )
+    submit = SubmitField('Save')
 
     def __init__(self, *args, **kwargs):
         """Create instance."""
@@ -56,10 +74,29 @@ class RegisterForm(FlaskForm):
             return False
         return True
 
+    def validate_on_activation(self, user_id):
+        initial_validation = super(RegisterForm, self).validate()
+        if not initial_validation:
+            return False
+        user = User.query.filter_by(email=self.email.data).first()
+        if user and not user.id == user_id:
+            self.email.errors.append("This email is already registered with another user.")
+            return False
+        return True
+
 
 class MultiCheckboxField(SelectMultipleField):
     widget = widgets.ListWidget(prefix_label=False)
     option_widget = widgets.CheckboxInput()
+
+
+class NonValidatingSelectField(SelectField):
+    """
+    Attempt to make an open ended select field that can accept dynamic
+    choices added by the browser.
+    """
+    def pre_validate(self, form):
+        pass
 
 
 class NewTaskForm(FlaskForm):
@@ -77,9 +114,30 @@ class NewScorekeeperForm(FlaskForm):
     scorekeeper = SelectField("Scorekeeper", choices=[('1', '1'), ('2', '2')])
 
 
+class NewCompForm(FlaskForm):
+    comp_name = StringField("Comp Name", validators=[DataRequired()])
+    comp_code = StringField('Short name',
+                            validators=[Optional(strip_whitespace=True), Length(max=8, message='max 8 chars')],
+                            description='An abbreviated name (max 8 chars) e.g. PGEuro20, '
+                                        'if empty will be calculated from name')
+    comp_class = SelectField('Category', choices=[('PG', 'PG'), ('HG', 'HG')])
+    comp_site = StringField('Location', validators=[DataRequired()], description='location of the competition')
+    date_from = DateField('Start Date', format='%Y-%m-%d', validators=[DataRequired()], default=date.today)
+    date_to = DateField('End Date', format='%Y-%m-%d', validators=[DataRequired()], default=date.today)
+
+    submit = SubmitField('Create')
+
+    def validate_on_submit(self):
+        result = super(NewCompForm, self).validate()
+        if self.date_from.data > self.date_to.data:
+            self.date_from.errors.append('Competition end date is before start date')
+            return False
+        return result
+
+
 class CompForm(FlaskForm):
     from formula import list_formulas
-    from frontendUtils import list_track_sources, list_gmt_offset
+    from frontendUtils import list_track_sources
 
     help_nom_launch = "When pilots do not take off for safety reasons, to avoid difficult launch conditions or bad " \
                       "conditions in the air, Launch Validity is reduced.. Nominal Launch defines a threshold as a " \
@@ -125,17 +183,14 @@ class CompForm(FlaskForm):
     date_to = DateField('End Date', format='%Y-%m-%d', validators=[DataRequired()], default=date.today)
     MD_name = StringField('Race Director')
 
-    timezones = list_gmt_offset()
-    time_offset = SelectField('GMT Offset', choices=timezones, id='select_time_offset', coerce=int, default=0,
+    time_offset = SelectField('GMT Offset', choices=time_zones, id='select_time_offset', coerce=int, default=0,
                               description='The default time offset for the comp. Individual tasks will have this '
                               'as a default but can be overridden if your comp spans multiple time zones'
                               ' or over change in daylight savings')
 
     pilot_registration = SelectField('Pilot Entry', choices=[(1, 'Registered'), (0, 'Open')], coerce=int,
-                                     description='Registered - only pilots registered are flying, '
-                                                 'open - all tracklogs uploaded are considered as entires')
-
-    cat_id = SelectField('Classification', coerce=int, default=0, id='select_classification')
+                                     default=1, description='Registered - only pilots registered are flying, '
+                                                            'open - all tracklogs uploaded are considered as entires')
 
     track_sources = list_track_sources()
     track_source = SelectField('Track Source', choices=track_sources, id='select_source',
@@ -179,19 +234,20 @@ class CompForm(FlaskForm):
     formula_time = SelectField('Time points', choices=[('on', 'On'), ('off', 'Off')])
 
     scoring_altitude = SelectField('Scoring Altitude', choices=[('GPS', 'GPS'), ('QNH', 'QNH')])
-    lead_factor = DecimalField('Leadfactor', default=1)
+    lead_factor = DecimalField('Leadfactor', places=1, default=1)
     no_goal_penalty = IntegerField('No goal penalty (%)', validators=[NumberRange(min=0, max=100)], default=100)
 
     tolerance = DecimalField('Turnpoint radius tolerance %', places=1, default=0.1)
     min_tolerance = IntegerField('Minimum turnpoint tolerance (m)')
-    glide_bonus = DecimalField('Glide bonus', validators=[InputRequired()], default=0)
+    glide_bonus = DecimalField('Glide bonus', validators=[InputRequired()], places=1, default=0)
     arr_alt_bonus = DecimalField('Height bonus', validators=[InputRequired()], default=0)
     arr_max_height = IntegerField('ESS height limit - upper', validators=[Optional(strip_whitespace=True)])
     arr_min_height = IntegerField('ESS height limit - lower', validators=[Optional(strip_whitespace=True)])
     validity_min_time = IntegerField('Minimum time (mins)')
-    scoreback_time = IntegerField('Scoreback time (mins)', description=help_score_back)
+    score_back_time = IntegerField('Scoreback time (mins)', description=help_score_back)
     max_JTG = IntegerField("Max Jump the gun (sec)", default=0)
-    JTG_penalty_per_sec = DecimalField('Jump the gun penalty per second', validators=[Optional(strip_whitespace=True)])
+    JTG_penalty_per_sec = DecimalField('Jump the gun penalty per second',
+                                       validators=[Optional(strip_whitespace=True)], places=2, default=0)
     check_launch = BooleanField('Check launch', description='If we check pilots leaving launch - i.e. launch is like '
                                                             'an exit cylinder. Individual tasks will have this '
                                                             'as a default but can be overridden.')
@@ -215,12 +271,10 @@ class CompForm(FlaskForm):
         if self.date_from.data > self.date_to.data:
             self.date_from.errors.append('Competition end date is before start date')
             return False
-        else:
-            return result
+        return result
 
 
 class TaskForm(FlaskForm):
-    from frontendUtils import list_gmt_offset
     # general
     comp_name = ""
     task_name = StringField("Task Name", description='optional. If you want to give the task a name. '
@@ -230,7 +284,8 @@ class TaskForm(FlaskForm):
     comment = StringField('Comment', description='Sometimes you may wish to make a comment that will show up'
                                                  ' in the competition overview page. e.g. "task stopped at 14:34"')
     date = DateField('Date', format='%Y-%m-%d', validators=[DataRequired()], default=date.today)
-    task_type = SelectField('Type', choices=[('race', 'Race'), ('elapsed time', 'Elapsed time')])
+    task_type = SelectField('Type', choices=[('race', 'Race'), ('elapsed time', 'Elapsed time')],
+                            validators=[DataRequired()], default='race')
     region = SelectField('Region', id='select_region', choices=[(0, ' -')], default=0, coerce=int,
                          validators=[Optional()], description='Determines the Waypoint listed, and the airspace used')
 
@@ -247,18 +302,13 @@ class TaskForm(FlaskForm):
     start_iteration = IntegerField('Number of gates', description='number of start iterations: 0 is indefinite up to '
                                                                   'start close time',
                                    validators=[Optional(strip_whitespace=True)])
-    # time_offset = DecimalField('GMT offset', validators=[InputRequired()], places=1, render_kw=dict(maxlength=5),
-    #                            description='The time offset for the task. Default value taken from the competition '
-    #                                        'time offset')
 
-    timezones = list_gmt_offset()
-    time_offset = SelectField('GMT Offset', choices=timezones, id='select_time_offset', coerce=int, default=0,
+    time_offset = SelectField('GMT Offset', choices=time_zones, id='select_time_offset', coerce=int, default=0,
                               description='The time offset for the task. Default value taken from the competition '
                               'time offset')
 
     check_launch = BooleanField('Check launch', description='If we check pilots leaving launch - i.e. launch is like '
                                                             'an exit cylinder')
-    # region = SelectField('Waypoint file', choices=[(1,'1'), (2,'2')])
 
     # airspace
     airspace_check = BooleanField('Airspace checking')
@@ -415,10 +465,12 @@ class ParticipantForm(FlaskForm):
     CIVL = IntegerField('CIVL', default=None,
                         validators=[Optional(strip_whitespace=True), NumberRange(min=0, max=999999)])
     name = StringField('Name', validators=[DataRequired(), Length(min=1, max=100)], description=name_desc)
-    nat = SelectField('Nat', coerce=str, validators=[DataRequired(), Length(min=3, max=3)], id='select_country')
+    birthdate = DateField('Birthdate', format='%Y-%m-%d', validators=[Optional(strip_whitespace=True)], default=None)
+    nat = SelectField('Nationality', coerce=str, validators=[DataRequired(), Length(min=3, max=3)], id='select_country')
     sex = SelectField('Sex', choices=[('M', 'M'), ('F', 'F')], default='M')
     glider = StringField('Glider', validators=[Optional(strip_whitespace=True), Length(max=100)])
-    certification = StringField('Certification', validators=[Optional(strip_whitespace=True)])
+    certification = NonValidatingSelectField('Certification',
+                                             validators=[Optional(strip_whitespace=True)], default=None)
     sponsor = StringField('Sponsor', validators=[Optional(strip_whitespace=True), Length(max=100)], description=sp_desc)
     team = StringField('Team', validators=[Optional(strip_whitespace=True)], default=None)
     nat_team = BooleanField('In National Team', default=1)
@@ -437,18 +489,122 @@ class ParticipantForm(FlaskForm):
 
 
 class EditScoreForm(FlaskForm):
-    penalty_bonus = SelectField(choices=[('penalty', 'Penalty'), ('bonus', 'Bonus')], id='penalty_bonus')
+    penalty_bonus = SelectField(choices=[(1, 'Penalty'), (-1, 'Bonus')], id='penalty_bonus', default=1)
     flat_penalty = IntegerField('points', default=0, id='penalty')
     comment = TextAreaField('Comment', render_kw={"rows": 3, "cols": 50}, id='comment')
 
 
-class ModifyUserForm(FlaskForm):
-    email = StringField('Email', validators=[DataRequired()])
+class UserForm(FlaskForm):
+    first_name = StringField('First Name', validators=[DataRequired(), Length(min=1, max=40)])
+    last_name = StringField('Last Name', validators=[DataRequired(), Length(min=2, max=40)])
+    nat = NonValidatingSelectField('Nationality', validators=[Optional(strip_whitespace=True)], default=None)
+    username = StringField("Username")
+    email = StringField('Email', validators=[DataRequired(), Email()])
     access = SelectField('Access Level', choices=[('pilot', 'Pilot'), ('pending', 'Pending'),
-                                                  ('scorekeeper', 'Scorekeeper'), ('admin', 'Admin'), ])
-    active = BooleanField('Enabled')
+                                                  ('scorekeeper', 'Scorekeeper'), ('admin', 'Admin'), ],
+                         default='pilot')
+    active = BooleanField('Enabled', default=1)
+
+    submit = SubmitField('Save')
+
+    def validate(self):
+        """Validate the form."""
+        initial_validation = super(UserForm, self).validate()
+        if not initial_validation:
+            return False
+        user = User.query.filter_by(username=self.username.data).first()
+        if user:
+            self.username.errors.append("Username (email) already registered")
+            return False
+        user = User.query.filter_by(email=self.email.data).first()
+        if user:
+            self.email.errors.append("Email already registered")
+            return False
+        return True
+
+
+class ModifyUserForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    access = SelectField('Access Level', choices=[('pilot', 'Pilot'), ('pending', 'Pending'),
+                                                  ('scorekeeper', 'Scorekeeper'), ('admin', 'Admin'), ],
+                         default='pilot')
+    active = BooleanField('Enabled', default=1)
+
+    submit = SubmitField('Save')
 
 
 class CompLaddersForm(FlaskForm):
     ladders = MultiCheckboxField('Active Ladders', coerce=int)
     submit = SubmitField('Save')
+
+
+class CompRankingForm(FlaskForm):
+    name_desc = 'Required, max 40 characters'
+    rank_name = StringField('Name', validators=[DataRequired(), Length(min=1, max=40)], description=name_desc)
+    rank_type = SelectField('Ranking Type', choices=[('overall', 'Overall'), ('cert', 'Certification'),
+                                                     ('birthdate', 'Birthdate'), ('female', 'Female'),
+                                                     ('nat', 'Nationality'), ('custom', 'Custom')], default='cert')
+    cert_id = NonValidatingSelectField('Certification', validators=[Optional(strip_whitespace=True)], default=None)
+    min_date = DateField('Starting from', format='%Y-%m-%d', validators=[Optional(strip_whitespace=True)], default=None)
+    max_date = DateField('Up to', format='%Y-%m-%d', validators=[Optional(strip_whitespace=True)], default=None)
+    attr_id = NonValidatingSelectField('Custom Attribute', validators=[Optional(strip_whitespace=True)], default=None)
+    rank_value = StringField('Attribute Value', validators=[Optional(strip_whitespace=True)], default=None)
+
+    submit = SubmitField('Save')
+
+
+class AirspaceCheckForm(FlaskForm):
+    name_desc = 'Required, max 40 characters'
+    notification_distance = IntegerField('Proximity Notification Distance (m.)', default=100,
+                                         validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    function = SelectField('Function Type', default='linear',
+                           choices=[('linear', 'Linear'), ('non-linear', 'Progressive')])
+    double_step = BooleanField('Double Step', default=0)
+    h_v = BooleanField('Different Vertical Limits', default=0)
+    h_outer_limit = IntegerField('Horiz. Outer Limit (m.)', default=50,
+                                 validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    h_boundary = IntegerField('Horiz. Boundary (m.)', default=0,
+                              validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    h_inner_limit = IntegerField('Horiz. Inner Limit (m.)', default=-30,
+                                 validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    h_boundary_penalty = SelectField('Boundary Penalty', choices=percentage_choices, default=0.2)
+    h_max_penalty = SelectField('Full Penalty', choices=percentage_choices, default=1)
+    v_outer_limit = IntegerField('Vert. Outer Limit (m.)', default=50,
+                                 validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    v_boundary = IntegerField('Vert. Boundary (m.)', default=0,
+                              validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    v_inner_limit = IntegerField('Vert. Inner Limit (m.)', default=-30,
+                                 validators=[Optional(strip_whitespace=True), NumberRange(min=-100, max=999)])
+    v_boundary_penalty = SelectField('Boundary Penalty', choices=percentage_choices, default=0.2)
+    v_max_penalty = SelectField('Full Penalty', choices=percentage_choices, default=1)
+
+    submit = SubmitField('Save')
+
+    def validate_on_submit(self):
+        result = super(AirspaceCheckForm, self).validate()
+        if self.h_outer_limit.data < self.h_inner_limit.data:
+            self.h_inner_limit.errors.append('cannot be greater than outer limit')
+            result = False
+        if self.v_outer_limit.data < self.v_inner_limit.data:
+            self.v_inner_limit.errors.append('cannot be greater than outer limit')
+            result = False
+        if self.function.data == 'linear' and self.double_step.data:
+            if self.h_outer_limit.data < self.h_boundary.data:
+                self.h_boundary.errors.append('cannot be greater than outer limit')
+                result = False
+            if self.h_boundary.data < self.h_inner_limit.data:
+                self.h_boundary.errors.append('cannot be smaller than inner limit')
+                result = False
+            if self.v_outer_limit.data < self.v_boundary.data:
+                self.v_boundary.errors.append('cannot be greater than outer limit')
+                result = False
+            if self.v_boundary.data < self.v_inner_limit.data:
+                self.v_boundary.errors.append('cannot be smaller than inner limit')
+                result = False
+            if self.h_boundary_penalty.data > self.h_max_penalty.data:
+                self.h_boundary_penalty.errors.append('cannot be greater than max penalty')
+                result = False
+            if self.v_boundary_penalty.data > self.v_max_penalty.data:
+                self.v_boundary_penalty.errors.append('cannot be greater than max penalty')
+                result = False
+        return result

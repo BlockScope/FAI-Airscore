@@ -209,6 +209,40 @@ def setup_admin():
     return render_template("public/setup_admin.html", form=form)
 
 
+@blueprint.route('/confirm_user/<token>', methods=['GET', 'POST'])
+def confirm_user(token):
+    email = frontendUtils.confirm_token(token)
+    user = User.query.filter_by(email=email).first()
+    if not (email and user):
+        flash('The email does not exist, or the token has expired. Please contact Administrators', 'warning')
+        return redirect(url_for('public.home'))
+    elif user.active:
+        flash('User is already active. Please contact Administrators', 'warning')
+        return redirect(url_for('public.home'))
+
+    form = RegisterForm(obj=user)
+    form.password.data = form.confirm.data = None
+
+    return render_template('public/confirm_user.html', user=user, user_form=form)
+
+
+@blueprint.route('/_activate_user/', methods=['GET', 'POST'])
+def _activate_user():
+    form = RegisterForm(request.form)
+    user_id = int(request.form.get('user_id'))
+    if form.validate_on_activation(user_id):
+        user = User.query.filter_by(id=user_id).first()
+        if not user:
+            return jsonify(success=False, error='User does not exist. Please contact Administrators')
+        user.email = form.email.data
+        user.username = form.username.data
+        user.set_password(form.password.data)
+        user.active = True
+        user.update()
+        return jsonify(success=True)
+    return jsonify(success=False, errors=form.errors)
+
+
 @blueprint.route('/reset_password_request', methods=['GET', 'POST'])
 def reset_password_request():
     form = LoginForm(request.form)
@@ -221,8 +255,12 @@ def reset_password_request():
             if frontendUtils.production():
                 current_app.task_queue.enqueue('send_email.send_password_reset_email', user)
             else:
-                import send_email
-                send_email.send_password_reset_email(user)
+                # import email
+                token = user.get_reset_password_token()
+                subject = '[Airscore] Reset Your Password'
+                text = render_template('email/reset_password.txt', user=user, token=token),
+                html = render_template('email/reset_password.html', user=user, token=token),
+                frontendUtils.send_email(recipients=user.email, subject=subject, text_body=text, html_body=html)
         flash('Check your email for the instructions to reset your password', category='info')
         return redirect(url_for('public.home'))
     return render_template('public/reset_password_request.html',
@@ -314,7 +352,7 @@ def competition(compid: int):
             task_map = make_map(layer_geojson=layer, points=wpt_coords, circles=turnpoints, polyline=short_route,
                                 goal_line=goal_line, margin=tolerance)
             task['opt_dist'] = '{:0.2f}'.format(task['opt_dist'] / 1000) + ' km'
-            task['tasQuality'] = '{:0.2f}'.format(task['day_quality'])
+            task['day_quality'] = '{:0.2f}'.format(task['day_quality'])
             task.update({'map': task_map._repr_html_()})
             all_tasks.append(task)
 
@@ -328,27 +366,31 @@ def competition(compid: int):
         return render_template('public/future_competition.html', comp=comp)
 
     if non_scored_tasks:
-        for t in non_scored_tasks:
-            task = t._asdict()
-            if not t.opt_dist or t.opt_dist == 0:
-                task['status'] = "Task not set"
-                task['opt_dist'] = '0 km'
+        for task in non_scored_tasks:
+            task['day_quality'] = ''
+            task['date'] = task['date'].strftime("%Y-%m-%d")
+
+            if not task['opt_dist'] or task['opt_dist'] == 0:
+                task['status'] = 'Task not set'
+                task['opt_dist'] = ''
+                task['task_type'] = ''
             else:
-                task['status'] = "Not yet scored"
                 wpt_coords, turnpoints, short_route, goal_line, tolerance, bbox, _, _ = get_map_json(task['id'])
                 layer['geojson'] = None
                 layer['bbox'] = bbox
                 task_map = make_map(layer_geojson=layer, points=wpt_coords, circles=turnpoints, polyline=short_route,
                                     goal_line=goal_line, margin=tolerance)
-                task['opt_dist'] = '{:0.2f}'.format(task['opt_dist'] / 1000) + ' km'
+                task['opt_dist'] = f"{'{:0.2f}'.format(task['opt_dist'] / 1000)} km"
                 task.update({'map': task_map._repr_html_()})
-                '''livetracking availability'''
-                task['live'] = Path(LIVETRACKDIR, str(task['id'])).is_file()
-                '''tracks download status'''
-                task['tracks_status'] = frontendUtils.task_has_valid_results(task['id'])
+                if not task['cancelled']:
+                    task['status'] = "Not yet scored"
+                    '''livetracking availability'''
+                    task['live'] = Path(LIVETRACKDIR, str(task['id'])).is_file()
+                    '''tracks download status'''
+                    task['tracks_status'] = frontendUtils.task_has_valid_results(task['id'])
+            if task['cancelled']:
+                task['status'] = "CANCELLED"
 
-            task['tasQuality'] = "-"
-            task['date'] = task['date'].strftime("%Y-%m-%d")
             all_tasks.append(task)
     all_tasks.sort(key=lambda k: k['date'], reverse=True)
 
@@ -383,8 +425,8 @@ def ext_competition(compid: int):
             layer['bbox'] = bbox
             task_map = make_map(layer_geojson=layer, points=wpt_coords, circles=turnpoints, polyline=short_route,
                                 goal_line=goal_line, margin=tolerance)
-            task['opt_dist'] = '{:0.2f}'.format(task['opt_dist'] / 1000) + ' km'
-            task['tasQuality'] = '{:0.2f}'.format(task['day_quality'])
+            task['opt_dist'] = f"{'{:0.2f}'.format(task['opt_dist'] / 1000)} km"
+            task['day_quality'] = '{:0.2f}'.format(task['day_quality'])
             task.update({'map': task_map._repr_html_()})
             all_tasks.append(task)
 
@@ -398,23 +440,27 @@ def ext_competition(compid: int):
         return render_template('public/future_competition.html', comp=comp)
 
     if non_scored_tasks:
-        for t in non_scored_tasks:
-            task = t._asdict()
-            if not t.opt_dist or t.opt_dist == 0:
-                task['status'] = "Task not set"
-                task['opt_dist'] = '0 km'
+        for task in non_scored_tasks:
+            task['day_quality'] = ''
+            task['date'] = task['date'].strftime("%Y-%m-%d")
+
+            if not task['opt_dist'] or task['opt_dist'] == 0:
+                task['status'] = 'Task not set'
+                task['opt_dist'] = ''
+                task['task_type'] = ''
             else:
-                task['status'] = "Not yet scored"
                 wpt_coords, turnpoints, short_route, goal_line, tolerance, bbox, _, _ = get_map_json(task['id'])
                 layer['geojson'] = None
                 layer['bbox'] = bbox
                 task_map = make_map(layer_geojson=layer, points=wpt_coords, circles=turnpoints, polyline=short_route,
                                     goal_line=goal_line, margin=tolerance)
-                task['opt_dist'] = '{:0.2f}'.format(task['opt_dist'] / 1000) + ' km'
+                task['opt_dist'] = f"{'{:0.2f}'.format(task['opt_dist'] / 1000)} km"
                 task.update({'map': task_map._repr_html_()})
+                if not task['cancelled']:
+                    task['status'] = "Not yet scored"
+            if task['cancelled']:
+                task['status'] = "CANCELLED"
 
-            task['tasQuality'] = "-"
-            task['date'] = task['date'].strftime("%Y-%m-%d")
             all_tasks.append(task)
     all_tasks.sort(key=lambda k: k['date'], reverse=True)
 
@@ -449,30 +495,7 @@ def ext_task_result(taskid: int):
         return render_template('404.html')
 
     compid = int(result_file['info']['comp_id'])
-    all_pilots = []
-    results = [p for p in result_file['results'] if p['result_type'] not in ['dnf', 'abs', 'nyp']]
-    for r in results:
-        pilot = {'id': r['ID'], 'fai_id': r['fai_id'], 'civl_id': r['civl_id'], 'nat': r['nat'], 'sex': r['sex'],
-                 'glider': r['glider'], 'glider_cert': r['glider_cert'], 'sponsor': r['sponsor'],
-                 'SSS_time': r['SSS_time'], 'distance': r['distance'], 'time_score': r['time_score'],
-                 'departure_score': r['departure_score'], 'arrival_score': r['arrival_score'],
-                 'distance_score': r['distance_score'], 'score': f"<b>{r['score']}</b>",
-                 'ranks': {'rank': f"<b>{r['rank']}</b>"}}
-        n = r['name']
-        sex = r['sex']
-        pilot['name'] = f'<span class="sex-{sex}">{n}</span>'
-        goal = r['goal_time']
-        pilot['ESS_time'] = r['ESS_time'] if goal else f"<del>{r['ESS_time']}</del>"
-        pilot['speed'] = r['speed'] if goal else f"<del>{r['speed']}</del>"
-        pilot['ss_time'] = r['ss_time'] if goal else f"<del>{r['ss_time']}</del>"
-        pilot['goal_time'] = goal
-        # ab = ''  # alt bonus
-        pilot['penalty'] = "" if r['penalty'] == '0.0' else r['penalty']
-        # setup sub-rankings
-        for i, c in enumerate(result_file['classes'][1:], 1):
-            pilot['ranks']['class' + str(i)] = f"{r[c['limit']]}"
-        all_pilots.append(pilot)
-    result_file['data'] = all_pilots
+
     return render_template('public/ext_task_result.html', taskid=taskid, compid=compid, results=result_file)
 
 
@@ -489,43 +512,14 @@ def task_result(taskid: int):
         return render_template('404.html')
 
     compid = int(result_file['info']['comp_id'])
-    all_pilots = []
-    results = [p for p in result_file['results'] if p['result_type'] not in ['dnf', 'abs', 'nyp']]
-    for r in results:
-        pilot = {'id': r['ID'], 'fai_id': r['fai_id'], 'civl_id': r['civl_id'], 'nat': r['nat'], 'sex': r['sex'],
-                 'glider': r['glider'], 'glider_cert': r['glider_cert'], 'sponsor': r['sponsor'],
-                 'SSS_time': r['SSS_time'], 'distance': r['distance'], 'time_score': r['time_score'],
-                 'departure_score': r['departure_score'], 'arrival_score': r['arrival_score'],
-                 'distance_score': r['distance_score'], 'score': f"<b>{r['score']}</b>",
-                 'ranks': {'rank': f"<b>{r['rank']}</b>"}}
-        n = r['name']
-        parid = r['par_id']
-        sex = r['sex']
-        if r['result_type'] in ['mindist', 'nyp'] or not r['track_file']:
-            pilot['name'] = f'<span class="sex-{sex}">{n}</span>'
-        else:
-            pilot['name'] = f'<a class="sex-{sex}" href="/map/{parid}-{taskid}">{n}</a>'
-        goal = r['goal_time']
-        pilot['ESS_time'] = r['ESS_time'] if goal else f"<del>{r['ESS_time']}</del>"
-        pilot['speed'] = r['speed'] if goal else f"<del>{r['speed']}</del>"
-        pilot['ss_time'] = r['ss_time'] if goal else f"<del>{r['ss_time']}</del>"
-        pilot['goal_time'] = goal
-        # ab = ''  # alt bonus
-        pilot['penalty'] = "" if r['penalty'] == '0.0' else r['penalty']
-        # setup sub-rankings
-        for i, c in enumerate(result_file['classes'][1:], 1):
-            pilot['ranks']['class' + str(i)] = f"{r[c['limit']]}"
-        all_pilots.append(pilot)
-    result_file['data'] = all_pilots
+
     return render_template('public/task_result.html', taskid=taskid, compid=compid, results=result_file)
 
 
 @blueprint.route('/ext_comp_result/<int:compid>')
 def ext_comp_result(compid: int):
-    from compUtils import get_comp_json, read_rankings
+    from compUtils import get_comp_json
     content = get_comp_json(compid)
-    if not content['rankings']:
-        content['rankings'] = read_rankings(compid)
     result_file = frontendUtils.get_pretty_data(content)
     if result_file == 'error':
         return render_template('404.html')
@@ -534,21 +528,6 @@ def ext_comp_result(compid: int):
         link, code = f"/ext_task_result/{t['id']}", t['task_code']
         t['link'] = f"<a href='{link}' target='_blank'>{code}</a>"
 
-    all_pilots = []
-    for r in result_file['results']:
-        pilot = {'id': r['ID'], 'fai_id': r['fai_id'], 'civl_id': r['civl_id'],
-                 'name': f"<span class='sex-{r['sex']}'><b>{r['name']}</b></span>", 'nat': r['nat'], 'sex': r['sex'],
-                 'glider': r['glider'], 'glider_cert': r['glider_cert'], 'sponsor': r['sponsor'],
-                 'score': f"<b>{r['score']}</b>", 'ranks': {'rank': f"<b>{r['rank']}</b>"}}
-        for i, c in enumerate(result_file['classes'][1:], 1):
-            pilot['ranks']['class' + str(i)] = f"{r[c['limit']]}"
-        pilot['results'] = []
-        for k, v in r['results'].items():
-            score = f"{v['score']}" if v['score'] == v['pre'] else f"{v['score']} <del>{v['pre']}</del>"
-            html = f"<span class='task_score'>{score}</span>"
-            pilot['results'].append(html)
-        all_pilots.append(pilot)
-    result_file['data'] = all_pilots
     return render_template('public/ext_comp_overall.html', compid=compid, results=result_file)
 
 
@@ -568,21 +547,6 @@ def comp_result(compid: int):
         link, code = f"/task_result/{t['id']}", t['task_code']
         t['link'] = f"<a href='{link}' target='_blank'>{code}</a>"
 
-    all_pilots = []
-    for r in result_file['results']:
-        pilot = {'id': r['ID'], 'fai_id': r['fai_id'], 'civl_id': r['civl_id'],
-                 'name': f"<span class='sex-{r['sex']}'><b>{r['name']}</b></span>", 'nat': r['nat'], 'sex': r['sex'],
-                 'glider': r['glider'], 'glider_cert': r['glider_cert'], 'sponsor': r['sponsor'],
-                 'score': f"<b>{r['score']}</b>", 'ranks': {'rank': f"<b>{r['rank']}</b>"}}
-        for i, c in enumerate(result_file['classes'][1:], 1):
-            pilot['ranks']['class' + str(i)] = f"{r[c['limit']]}"
-        pilot['results'] = []
-        for k, v in r['results'].items():
-            score = f"{v['score']}" if v['score'] == v['pre'] else f"{v['score']} <del>{v['pre']}</del>"
-            html = f"<span class='task_score'>{score}</span>"
-            pilot['results'].append(html)
-        all_pilots.append(pilot)
-    result_file['data'] = all_pilots
     return render_template('public/comp_overall.html', compid=compid, results=result_file)
 
 
