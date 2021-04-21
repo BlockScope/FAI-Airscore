@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "airscore"
 version = "0.1.0"
-description = ""
+description = "GAP based Paragliding and Hang Gliding scoring from IGC files"
 authors = ["Antonio Golfari <antoniogolfari@gmail.com>", "Stuart Mackintosh <stuart.mackintosh@gmail.com>"]
 license = "GPL-3.0"
 
